@@ -177,6 +177,33 @@ fn linking_is_idempotent_and_rejects_cycles() {
 }
 
 #[test]
+fn linking_root_under_parent_moves_it_out_of_roots() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let parent = add_root_node(&graph, statement("Parent", "")).unwrap();
+    let child = add_root_node(&graph, statement("Child", "")).unwrap();
+
+    link_existing_node(&graph, &parent, &child).unwrap();
+    link_existing_node(&graph, &parent, &child).unwrap();
+
+    assert!(
+        !list_roots(&graph)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == child)
+    );
+    assert_eq!(
+        list_children(&graph, &parent)
+            .unwrap()
+            .into_iter()
+            .map(|node| (node.id, node.is_alias))
+            .collect::<Vec<_>>(),
+        vec![(child.clone(), false)]
+    );
+    assert_eq!(list_parents(&graph, &child).unwrap()[0].id, parent);
+}
+
+#[test]
 fn unlinking_canonical_parent_promotes_alias_and_preserves_subtree() {
     let temp = tempdir().unwrap();
     let graph = init_graph(temp.path()).unwrap();
@@ -352,12 +379,16 @@ fn read_node_surfaces_corrupt_existing_node_files() {
     let graph = init_graph(temp.path()).unwrap();
     let missing = add_root_node(&graph, statement("Missing Markdown", "")).unwrap();
     let invalid = add_root_node(&graph, statement("Invalid Markdown", "")).unwrap();
+    let missing_children =
+        add_root_node(&graph, statement("Missing Children Directory", "")).unwrap();
     let missing_node = read_node(&graph, &missing).unwrap();
     let invalid_node = read_node(&graph, &invalid).unwrap();
+    let missing_children_node = read_node(&graph, &missing_children).unwrap();
     let invalid_node_file = invalid_node.canonical_path.join("node.md");
 
     fs::remove_file(missing_node.canonical_path.join("node.md")).unwrap();
     fs::write(&invalid_node_file, "not front matter").unwrap();
+    fs::remove_dir_all(missing_children_node.canonical_path.join("children")).unwrap();
 
     assert!(matches!(
         read_node(&graph, &missing),
@@ -366,6 +397,10 @@ fn read_node_surfaces_corrupt_existing_node_files() {
     assert!(matches!(
         read_node(&graph, &invalid),
         Err(GraphError::InvalidMarkdown { path, .. }) if path == invalid_node_file
+    ));
+    assert!(matches!(
+        read_node(&graph, &missing_children),
+        Err(GraphError::MissingChildrenDirectory(path)) if path == missing_children_node.canonical_path
     ));
 }
 
@@ -481,6 +516,81 @@ fn symlink_targets_outside_graph_are_rejected() {
 
 #[test]
 #[cfg(unix)]
+fn symlink_alias_suffix_must_match_target_id() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let parent = add_root_node(&graph, statement("Parent", "")).unwrap();
+    let target = add_root_node(&graph, statement("Target", "")).unwrap();
+    let parent_node = read_node(&graph, &parent).unwrap();
+    let target_node = read_node(&graph, &target).unwrap();
+    let wrong_id = if target == "550e8400-e29b-41d4-a716-446655440000" {
+        "7d9f2e5c-0f22-4c18-a0be-9f23e772a0bc"
+    } else {
+        "550e8400-e29b-41d4-a716-446655440000"
+    };
+    let alias_path = parent_node
+        .canonical_path
+        .join("children")
+        .join(format!("target--{wrong_id}"));
+
+    std::os::unix::fs::symlink(&target_node.canonical_path, &alias_path).unwrap();
+
+    assert!(rebuild_index(&graph).unwrap().problems.iter().any(
+        |problem| matches!(problem, GraphProblem::InvalidMarkdown { path, reason }
+            if path == &alias_path && reason == "node directory id suffix does not match target metadata id")
+    ));
+    assert!(matches!(
+        list_children(&graph, &parent),
+        Err(GraphError::InvalidMarkdown { path, .. }) if path == alias_path
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn broken_symlink_only_node_id_surfaces_for_parent_and_ancestor_listing() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let parent = add_root_node(&graph, statement("Parent", "")).unwrap();
+    let valid_child = add_root_node(&graph, statement("Valid Child", "")).unwrap();
+    let parent_node = read_node(&graph, &parent).unwrap();
+    let missing_id = if parent == "550e8400-e29b-41d4-a716-446655440000" {
+        "7d9f2e5c-0f22-4c18-a0be-9f23e772a0bc"
+    } else {
+        "550e8400-e29b-41d4-a716-446655440000"
+    };
+    let alias_path = parent_node
+        .canonical_path
+        .join("children")
+        .join(format!("missing--{missing_id}"));
+    let valid_alias_path = parent_node
+        .canonical_path
+        .join("children")
+        .join(format!("valid-child--{valid_child}"));
+
+    std::os::unix::fs::symlink(temp.path().join("missing-target"), &alias_path).unwrap();
+    std::os::unix::fs::symlink(temp.path().join("other-missing-target"), &valid_alias_path)
+        .unwrap();
+
+    assert!(matches!(
+        list_parents(&graph, missing_id),
+        Err(GraphError::BrokenSymlink(path)) if path == alias_path
+    ));
+    assert!(matches!(
+        list_ancestors(&graph, missing_id, TraversalOptions::default()),
+        Err(GraphError::BrokenSymlink(path)) if path == alias_path
+    ));
+    assert!(matches!(
+        list_parents(&graph, &valid_child),
+        Err(GraphError::BrokenSymlink(path)) if path == valid_alias_path
+    ));
+    assert!(matches!(
+        list_ancestors(&graph, &valid_child, TraversalOptions::default()),
+        Err(GraphError::BrokenSymlink(path)) if path == valid_alias_path
+    ));
+}
+
+#[test]
+#[cfg(unix)]
 fn symlinked_roots_directory_is_rejected_before_scanning_or_writing() {
     let graph_temp = tempdir().unwrap();
     let outside = tempdir().unwrap();
@@ -533,7 +643,10 @@ fn symlinked_children_directory_is_not_scanned_or_written_through() {
             .any(|problem| matches!(problem, GraphProblem::MissingChildrenDirectory { path } if path == &root_node.canonical_path))
     );
     assert!(!index.nodes.iter().any(|node| node.id == outside_id));
-    assert!(list_children(&graph, &root).unwrap().is_empty());
+    assert!(matches!(
+        list_children(&graph, &root),
+        Err(GraphError::MissingChildrenDirectory(path)) if path == root_node.canonical_path
+    ));
     assert!(matches!(
         add_child_node(&graph, &root, statement("Should Not Escape", "")),
         Err(GraphError::MissingChildrenDirectory(path)) if path == root_node.canonical_path
@@ -614,7 +727,8 @@ fn promotion_rewrites_symlinks_inside_and_pointing_into_moved_subtree() {
     let deep_root = add_root_node(&graph, statement("Deep Root", "")).unwrap();
     let deep_parent = add_child_node(&graph, &deep_root, statement("Deep Parent", "")).unwrap();
     let outside_parent = add_root_node(&graph, statement("Outside Parent", "")).unwrap();
-    let external = add_root_node(&graph, statement("External", "")).unwrap();
+    let external_parent = add_root_node(&graph, statement("External Parent", "")).unwrap();
+    let external = add_child_node(&graph, &external_parent, statement("External", "")).unwrap();
     let child = add_child_node(&graph, &old_parent, statement("Child", "")).unwrap();
     let grandchild = add_child_node(&graph, &child, statement("Grandchild", "")).unwrap();
 
@@ -652,7 +766,8 @@ fn move_to_roots_rewrites_symlinks_inside_and_pointing_into_moved_subtree() {
     let graph = init_graph(temp.path()).unwrap();
     let old_parent = add_root_node(&graph, statement("Old Parent", "")).unwrap();
     let outside_parent = add_root_node(&graph, statement("Outside Parent", "")).unwrap();
-    let external = add_root_node(&graph, statement("External", "")).unwrap();
+    let external_parent = add_root_node(&graph, statement("External Parent", "")).unwrap();
+    let external = add_child_node(&graph, &external_parent, statement("External", "")).unwrap();
     let child = add_child_node(&graph, &old_parent, statement("Child", "")).unwrap();
     let grandchild = add_child_node(&graph, &child, statement("Grandchild", "")).unwrap();
 

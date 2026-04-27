@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GraphError;
 use crate::fs_utils::{
-    children_path, has_node_dir_suffix, node_file_path, node_id_from_dir_name, real_dir_exists,
-    real_file_exists, resolve_symlink_path, roots_path, validate_node_id, validate_title,
+    NODE_FILE, children_path, has_node_dir_suffix, node_file_path, node_id_from_dir_name,
+    real_dir_exists, real_file_exists, resolve_symlink_path, roots_path, validate_node_id,
+    validate_title,
 };
 use crate::markdown::{ParsedMarkdown, parse_node_markdown};
 use crate::model::{
@@ -64,10 +65,12 @@ pub(crate) fn canonical_node<'a>(
     id: &str,
 ) -> Result<&'a ScannedNode, GraphError> {
     validate_node_id(id)?;
-    let node = scan
-        .nodes
-        .get(id)
-        .ok_or_else(|| GraphError::NodeNotFound(id.to_string()))?;
+    let Some(node) = scan.nodes.get(id) else {
+        return match entry_problem_error_for_node_id(scan, id) {
+            Some(error) => Err(error),
+            None => Err(GraphError::NodeNotFound(id.to_string())),
+        };
+    };
     if node.canonical_paths.len() > 1 {
         return Err(GraphError::DuplicateCanonicalNode {
             id: id.to_string(),
@@ -80,6 +83,9 @@ pub(crate) fn canonical_node<'a>(
             None => PathBuf::from(id),
         };
         return Err(GraphError::BrokenSymlink(path));
+    }
+    if let Some(error) = structural_problem_error_for_node(scan, node) {
+        return Err(error);
     }
     Ok(node)
 }
@@ -108,11 +114,21 @@ pub(crate) fn find_edge<'a>(
         .find(|edge| edge.parent_id == parent_id && edge.child_id == child_id)
 }
 
-pub(crate) fn broken_symlink_under_parent(scan: &ScanResult, parent_id: &str) -> Option<PathBuf> {
-    scan.broken_symlinks
+pub(crate) fn problem_error_under_container(
+    scan: &ScanResult,
+    container: &Path,
+) -> Option<GraphError> {
+    scan.problems
         .iter()
-        .find(|entry| entry.parent_id.as_deref() == Some(parent_id))
-        .map(|entry| entry.path.clone())
+        .find(|problem| problem_is_directly_under_container(problem, container))
+        .map(graph_problem_to_error)
+}
+
+pub(crate) fn entry_problem_error_for_node_id(scan: &ScanResult, id: &str) -> Option<GraphError> {
+    scan.problems
+        .iter()
+        .find(|problem| graph_problem_node_id(problem).as_deref() == Some(id))
+        .map(graph_problem_to_error)
 }
 
 pub(crate) fn graph_index(scan: &ScanResult) -> GraphIndex {
@@ -261,6 +277,13 @@ fn scan_symlink_entry(
         return Ok(());
     };
     let id = parsed.id.clone();
+    if node_id_from_dir_name(link_path).as_deref() != Some(id.as_str()) {
+        scanner.result.problems.push(GraphProblem::InvalidMarkdown {
+            path: link_path.to_path_buf(),
+            reason: "node directory id suffix does not match target metadata id".to_string(),
+        });
+        return Ok(());
+    }
     add_alias(&mut scanner.result, &id, link_path.to_path_buf(), parsed);
 
     if let Some(parent_id) = parent_id {
@@ -457,12 +480,78 @@ fn detect_cycle_from<'a>(
     visited.insert(id);
 }
 
-pub(crate) fn summary_for(scan: &ScanResult, id: &str, is_alias: bool) -> Option<NodeSummary> {
-    node_summary(scan.nodes.get(id)?, is_alias)
+fn structural_problem_error_for_node(scan: &ScanResult, node: &ScannedNode) -> Option<GraphError> {
+    scan.problems.iter().find_map(|problem| match problem {
+        GraphProblem::MissingChildrenDirectory { path }
+            if node
+                .canonical_paths
+                .iter()
+                .any(|node_path| node_path == path) =>
+        {
+            Some(graph_problem_to_error(problem))
+        }
+        _ => None,
+    })
 }
 
-pub(crate) fn node_id_from_entry_path(path: &Path) -> Option<String> {
+fn graph_problem_node_id(problem: &GraphProblem) -> Option<String> {
+    match problem {
+        GraphProblem::BrokenSymlink { path }
+        | GraphProblem::MissingNodeMarkdown { path }
+        | GraphProblem::MissingChildrenDirectory { path }
+        | GraphProblem::InvalidMarkdown { path, .. } => problem_path_node_id(path),
+        GraphProblem::DuplicateCanonicalNode { .. } | GraphProblem::CycleDetected { .. } => None,
+    }
+}
+
+fn problem_path_node_id(path: &Path) -> Option<String> {
+    if path.file_name().and_then(|name| name.to_str()) == Some(NODE_FILE) {
+        return path.parent().and_then(node_id_from_dir_name);
+    }
     node_id_from_dir_name(path)
+}
+
+fn graph_problem_to_error(problem: &GraphProblem) -> GraphError {
+    match problem {
+        GraphProblem::BrokenSymlink { path } => GraphError::BrokenSymlink(path.clone()),
+        GraphProblem::DuplicateCanonicalNode { id, paths } => GraphError::DuplicateCanonicalNode {
+            id: id.clone(),
+            paths: paths.clone(),
+        },
+        GraphProblem::MissingNodeMarkdown { path } => GraphError::MissingNodeMarkdown(path.clone()),
+        GraphProblem::MissingChildrenDirectory { path } => {
+            GraphError::MissingChildrenDirectory(path.clone())
+        }
+        GraphProblem::InvalidMarkdown { path, reason } => GraphError::InvalidMarkdown {
+            path: path.clone(),
+            reason: reason.clone(),
+        },
+        GraphProblem::CycleDetected { .. } => GraphError::CycleDetected,
+    }
+}
+
+fn problem_is_directly_under_container(problem: &GraphProblem, container: &Path) -> bool {
+    match problem {
+        GraphProblem::BrokenSymlink { path }
+        | GraphProblem::InvalidMarkdown { path, .. }
+        | GraphProblem::MissingNodeMarkdown { path }
+        | GraphProblem::MissingChildrenDirectory { path } => {
+            problem_entry_path(path).parent() == Some(container)
+        }
+        GraphProblem::DuplicateCanonicalNode { .. } | GraphProblem::CycleDetected { .. } => false,
+    }
+}
+
+fn problem_entry_path(path: &Path) -> &Path {
+    if path.file_name().and_then(|name| name.to_str()) == Some(NODE_FILE) {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    }
+}
+
+pub(crate) fn summary_for(scan: &ScanResult, id: &str, is_alias: bool) -> Option<NodeSummary> {
+    node_summary(scan.nodes.get(id)?, is_alias)
 }
 
 #[cfg(test)]

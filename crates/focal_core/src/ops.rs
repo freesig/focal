@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GraphError;
 use crate::fs_utils::{
-    NODE_FILE, children_path, create_relative_dir_symlink, ensure_real_dir_inside,
-    generate_node_id, is_path_inside_any, node_file_path, now_unix, path_sort_key, real_dir_exists,
-    roots_path, safe_remove_dir_all, safe_remove_file, safe_rename, unique_node_path,
-    validate_node_id, validate_title, write_file_atomically,
+    children_path, create_relative_dir_symlink, ensure_real_dir_inside, generate_node_id,
+    is_path_inside_any, node_file_path, now_unix, path_sort_key, real_dir_exists, roots_path,
+    safe_remove_dir_all, safe_remove_file, safe_rename, unique_node_path, validate_node_id,
+    validate_title, write_file_atomically,
 };
 use crate::markdown::render_node_markdown;
 use crate::model::{
@@ -15,9 +15,9 @@ use crate::model::{
     NodeSummary, OrphanPolicy, TraversalOptions,
 };
 use crate::scan::{
-    ScanResult, ScannedNode, broken_symlink_under_parent, canonical_node, canonical_path,
-    child_edges, find_edge, graph_index, node_summary, parent_edges, scan_graph, sort_summaries,
-    summary_for,
+    ScanResult, ScannedNode, canonical_node, canonical_path, child_edges,
+    entry_problem_error_for_node_id, find_edge, graph_index, node_summary, parent_edges,
+    problem_error_under_container, scan_graph, sort_summaries, summary_for,
 };
 
 pub fn init_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError> {
@@ -65,19 +65,7 @@ pub fn add_child_node(
 pub fn read_node(graph: &IdeaGraph, node_id: &str) -> Result<Node, GraphError> {
     validate_node_id(node_id)?;
     let scan = scan_graph(graph)?;
-    let node = match canonical_node(&scan, node_id) {
-        Ok(node) => node,
-        Err(GraphError::NodeNotFound(_)) => {
-            if let Some(error) = corrupt_node_error_for_id(&scan, node_id) {
-                return Err(error);
-            }
-            if let Some(path) = broken_symlink_for_id(&scan, node_id) {
-                return Err(GraphError::BrokenSymlink(path));
-            }
-            return Err(GraphError::NodeNotFound(node_id.to_string()));
-        }
-        Err(error) => return Err(error),
-    };
+    let node = canonical_node(&scan, node_id)?;
     node_from_scanned(node)
 }
 
@@ -165,6 +153,13 @@ pub fn link_existing_node(
             parent_path.to_path_buf(),
         ));
     }
+
+    if parent_edges(&scan, child_id).is_empty()
+        && child_path.parent() == Some(roots_path(&graph.root).as_path())
+    {
+        return move_root_node_under_parent(graph, &scan, child, &container);
+    }
+
     let link_path = unique_node_path(&container, &child.title, child_id)?;
     create_relative_dir_symlink(&graph.root, child_path, &link_path)
 }
@@ -239,9 +234,11 @@ pub fn list_roots(graph: &IdeaGraph) -> Result<Vec<NodeSummary>, GraphError> {
 pub fn list_children(graph: &IdeaGraph, node_id: &str) -> Result<Vec<NodeSummary>, GraphError> {
     validate_node_id(node_id)?;
     let scan = scan_graph(graph)?;
-    canonical_node(&scan, node_id)?;
-    if let Some(path) = broken_symlink_under_parent(&scan, node_id) {
-        return Err(GraphError::BrokenSymlink(path));
+    let node = canonical_node(&scan, node_id)?;
+    let node_path =
+        canonical_path(node).ok_or_else(|| GraphError::NodeNotFound(node_id.to_string()))?;
+    if let Some(error) = problem_error_under_container(&scan, &children_path(node_path)) {
+        return Err(error);
     }
     let mut summaries = Vec::new();
     for edge in child_edges(&scan, node_id) {
@@ -258,6 +255,9 @@ pub fn list_parents(graph: &IdeaGraph, node_id: &str) -> Result<Vec<NodeSummary>
     validate_node_id(node_id)?;
     let scan = scan_graph(graph)?;
     canonical_node(&scan, node_id)?;
+    if let Some(error) = entry_problem_error_for_node_id(&scan, node_id) {
+        return Err(error);
+    }
     let mut summaries = Vec::new();
     for edge in parent_edges(&scan, node_id) {
         let parent = canonical_node(&scan, &edge.parent_id)?;
@@ -614,6 +614,26 @@ fn move_node_to_roots(
     Ok(())
 }
 
+fn move_root_node_under_parent(
+    graph: &IdeaGraph,
+    scan: &ScanResult,
+    node: &ScannedNode,
+    parent_children: &Path,
+) -> Result<(), GraphError> {
+    let old_canonical_path =
+        canonical_path(node).ok_or_else(|| GraphError::NodeNotFound(node.id.clone()))?;
+    let target = unique_node_path(parent_children, &node.title, &node.id)?;
+    let symlink_rewrites =
+        symlink_rewrites_for_subtree_move(scan, old_canonical_path, &target, None);
+    safe_rename(&graph.root, old_canonical_path, &target)?;
+
+    for rewrite in symlink_rewrites {
+        rewrite_existing_alias(graph, &rewrite.link_path, &rewrite.target_path)?;
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct SymlinkRewrite {
     link_path: PathBuf,
@@ -742,13 +762,21 @@ fn sorted_neighbors(
     direction: TraversalDirection,
 ) -> Result<Vec<NodeSummary>, GraphError> {
     let mut summaries = match direction {
-        TraversalDirection::Ancestors => parent_edges(scan, node_id)
-            .into_iter()
-            .filter_map(|edge| summary_for(scan, &edge.parent_id, false))
-            .collect::<Vec<_>>(),
+        TraversalDirection::Ancestors => {
+            if let Some(error) = entry_problem_error_for_node_id(scan, node_id) {
+                return Err(error);
+            }
+            parent_edges(scan, node_id)
+                .into_iter()
+                .filter_map(|edge| summary_for(scan, &edge.parent_id, false))
+                .collect::<Vec<_>>()
+        }
         TraversalDirection::Descendants => {
-            if let Some(path) = broken_symlink_under_parent(scan, node_id) {
-                return Err(GraphError::BrokenSymlink(path));
+            let parent = canonical_node(scan, node_id)?;
+            let parent_path = canonical_path(parent)
+                .ok_or_else(|| GraphError::NodeNotFound(node_id.to_string()))?;
+            if let Some(error) = problem_error_under_container(scan, &children_path(parent_path)) {
+                return Err(error);
             }
             let mut summaries = Vec::new();
             for edge in child_edges(scan, node_id) {
@@ -762,44 +790,4 @@ fn sorted_neighbors(
     };
     sort_summaries(&mut summaries);
     Ok(summaries)
-}
-
-fn broken_symlink_for_id(scan: &ScanResult, node_id: &str) -> Option<PathBuf> {
-    scan.problems.iter().find_map(|problem| match problem {
-        crate::model::GraphProblem::BrokenSymlink { path }
-            if problem_path_node_id(path).as_deref() == Some(node_id) =>
-        {
-            Some(path.clone())
-        }
-        _ => None,
-    })
-}
-
-fn corrupt_node_error_for_id(scan: &ScanResult, node_id: &str) -> Option<GraphError> {
-    scan.problems.iter().find_map(|problem| match problem {
-        crate::model::GraphProblem::MissingNodeMarkdown { path }
-            if problem_path_node_id(path).as_deref() == Some(node_id) =>
-        {
-            Some(GraphError::MissingNodeMarkdown(path.clone()))
-        }
-        crate::model::GraphProblem::InvalidMarkdown { path, reason }
-            if problem_path_node_id(path).as_deref() == Some(node_id) =>
-        {
-            Some(GraphError::InvalidMarkdown {
-                path: path.clone(),
-                reason: reason.clone(),
-            })
-        }
-        _ => None,
-    })
-}
-
-fn problem_path_node_id(path: &Path) -> Option<String> {
-    if let Some(id) = crate::scan::node_id_from_entry_path(path) {
-        return Some(id);
-    }
-    if path.file_name().and_then(|name| name.to_str()) == Some(NODE_FILE) {
-        return path.parent().and_then(crate::scan::node_id_from_entry_path);
-    }
-    None
 }
