@@ -205,3 +205,101 @@ fn strip_line_ending(line: &str) -> &str {
 fn trim_trailing_line_endings(value: &str) -> &str {
     value.trim_end_matches(['\r', '\n'])
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn metadata(id: &str, kind: &str, title: &str) -> String {
+        format!(
+            "---\nid: {id}\nkind: {kind}\ntitle: {title}\ncreated_at_unix: 1\nupdated_at_unix: 2\n---\n\n"
+        )
+    }
+
+    #[test]
+    fn spec_08_statement_markdown_round_trips_without_heading_management() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let content = NodeContent::Statement {
+            body: "# Human heading\n\nBody text\n".to_string(),
+        };
+
+        let rendered = render_node_markdown(id, &NodeKind::Statement, "A Title", 10, 11, &content);
+
+        assert!(rendered.starts_with(
+            "---\nid: 550e8400-e29b-41d4-a716-446655440000\nkind: statement\ntitle: A Title\ncreated_at_unix: 10\nupdated_at_unix: 11\n---\n\n"
+        ));
+        assert!(rendered.contains("# Human heading"));
+
+        let parsed = parse_node_markdown(Path::new("node.md"), &rendered).unwrap();
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.kind, NodeKind::Statement);
+        assert_eq!(parsed.title, "A Title");
+        assert_eq!(parsed.content, content);
+    }
+
+    #[test]
+    fn spec_08_question_answer_markdown_requires_managed_sections() {
+        let id = "7d9f2e5c-0f22-4c18-a0be-9f23e772a0bc";
+        let rendered = render_node_markdown(
+            id,
+            &NodeKind::QuestionAnswer,
+            "Why",
+            1,
+            1,
+            &NodeContent::QuestionAnswer {
+                question: "Why use symlinks?".to_string(),
+                answer: String::new(),
+            },
+        );
+
+        let parsed = parse_node_markdown(Path::new("qa.md"), &rendered).unwrap();
+        assert_eq!(
+            parsed.content,
+            NodeContent::QuestionAnswer {
+                question: "Why use symlinks?".to_string(),
+                answer: String::new(),
+            }
+        );
+
+        let missing_answer = format!(
+            "{}## Question\n\nWhy?",
+            metadata(id, "qa", "Missing answer")
+        );
+        assert!(
+            parse_node_markdown(Path::new("qa.md"), &missing_answer)
+                .unwrap_err()
+                .contains("missing `## Answer`")
+        );
+
+        let empty_question = format!(
+            "{}## Question\n\n\n## Answer\n\nLater",
+            metadata(id, "qa", "Empty")
+        );
+        assert_eq!(
+            parse_node_markdown(Path::new("qa.md"), &empty_question).unwrap_err(),
+            "question must not be empty"
+        );
+    }
+
+    #[test]
+    fn spec_08_markdown_parser_rejects_invalid_metadata_blocks() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let duplicate = format!(
+            "---\nid: {id}\nkind: statement\nkind: statement\ntitle: Duplicate\ncreated_at_unix: 1\nupdated_at_unix: 1\n---\n\nBody"
+        );
+        assert_eq!(
+            parse_node_markdown(Path::new("node.md"), &duplicate).unwrap_err(),
+            "duplicate metadata field `kind`"
+        );
+
+        let invalid_timestamp = format!(
+            "---\nid: {id}\nkind: statement\ntitle: Bad time\ncreated_at_unix: now\nupdated_at_unix: 1\n---\n\nBody"
+        );
+        assert_eq!(
+            parse_node_markdown(Path::new("node.md"), &invalid_timestamp).unwrap_err(),
+            "invalid unix timestamp `now`"
+        );
+    }
+}

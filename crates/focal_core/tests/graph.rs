@@ -4,8 +4,8 @@ use std::path::Path;
 use focal_core::{
     DeleteMode, GraphError, GraphProblem, NewNode, NodeContent, NodeKind, NodePatch, OrphanPolicy,
     TraversalOptions, add_child_node, add_root_node, delete_node, init_graph, link_existing_node,
-    list_children, list_descendants, list_parents, list_roots, open_graph, read_node,
-    rebuild_index, unlink_child, update_node,
+    list_ancestors, list_children, list_descendants, list_parents, list_roots, open_graph,
+    read_node, rebuild_index, unlink_child, update_node,
 };
 use tempfile::tempdir;
 
@@ -543,6 +543,276 @@ fn duplicate_canonical_errors_are_preserved() {
         add_child_node(&graph, &parent, statement("Child", "")),
         Err(GraphError::DuplicateCanonicalNode { id, .. }) if id == parent
     ));
+}
+
+#[test]
+fn root_and_child_question_answer_nodes_support_empty_answers() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+
+    let root = add_root_node(&graph, qa("Root question", "What is the root?", "")).unwrap();
+    let child = add_child_node(
+        &graph,
+        &root,
+        qa("Child question", "What follows?", "An answer."),
+    )
+    .unwrap();
+
+    assert_uuid_shape(&root);
+    assert_uuid_shape(&child);
+    assert_eq!(
+        read_node(&graph, &root).unwrap().content,
+        NodeContent::QuestionAnswer {
+            question: "What is the root?".to_string(),
+            answer: String::new(),
+        }
+    );
+    assert_eq!(
+        list_children(&graph, &root)
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>(),
+        vec![child]
+    );
+}
+
+#[test]
+fn question_answer_updates_keep_identity_paths_and_managed_sections() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let id = add_root_node(&graph, qa("Original title", "Old question?", "Old answer.")).unwrap();
+    let before = read_node(&graph, &id).unwrap();
+
+    let updated = update_node(
+        &graph,
+        &id,
+        NodePatch {
+            title: Some("New title".to_string()),
+            content: Some(NodeContent::QuestionAnswer {
+                question: "New question?".to_string(),
+                answer: "New answer.".to_string(),
+            }),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(updated.id, id);
+    assert_eq!(updated.canonical_path, before.canonical_path);
+    assert_eq!(updated.alias_paths, before.alias_paths);
+    assert!(updated.updated_at_unix > before.updated_at_unix);
+    assert_eq!(
+        updated.content,
+        NodeContent::QuestionAnswer {
+            question: "New question?".to_string(),
+            answer: "New answer.".to_string(),
+        }
+    );
+
+    let markdown = fs::read_to_string(updated.canonical_path.join("node.md")).unwrap();
+    assert!(markdown.contains("title: New title"));
+    assert!(markdown.contains("## Question\n\nNew question?"));
+    assert!(markdown.contains("## Answer\n\nNew answer."));
+    assert!(
+        updated
+            .canonical_path
+            .ends_with(format!("original-title--{id}"))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn ancestors_descendants_deduplicate_shared_paths_and_ignore_manual_cycle_start() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let root = add_root_node(&graph, statement("Root", "")).unwrap();
+    let alpha = add_child_node(&graph, &root, statement("Alpha Branch", "")).unwrap();
+    let beta = add_child_node(&graph, &root, statement("Beta Branch", "")).unwrap();
+    let shared = add_child_node(&graph, &beta, statement("Shared", "")).unwrap();
+    link_existing_node(&graph, &alpha, &shared).unwrap();
+
+    assert_eq!(
+        list_descendants(&graph, &root, TraversalOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|node| node.title)
+            .collect::<Vec<_>>(),
+        vec!["Alpha Branch", "Beta Branch", "Shared"]
+    );
+    assert_eq!(
+        list_ancestors(&graph, &shared, TraversalOptions::default())
+            .unwrap()
+            .into_iter()
+            .map(|node| node.title)
+            .collect::<Vec<_>>(),
+        vec!["Alpha Branch", "Beta Branch", "Root"]
+    );
+
+    let root_node = read_node(&graph, &root).unwrap();
+    let shared_node = read_node(&graph, &shared).unwrap();
+    std::os::unix::fs::symlink(
+        &root_node.canonical_path,
+        shared_node
+            .canonical_path
+            .join("children")
+            .join(format!("root-cycle--{root}")),
+    )
+    .unwrap();
+
+    assert!(
+        rebuild_index(&graph)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, GraphProblem::CycleDetected { .. }))
+    );
+    let descendants = list_descendants(&graph, &root, TraversalOptions::default()).unwrap();
+    assert!(!descendants.iter().any(|node| node.id == root));
+    assert_eq!(
+        descendants.iter().filter(|node| node.id == shared).count(),
+        1
+    );
+}
+
+#[test]
+fn rebuild_index_reports_sorted_nodes_edges_and_alias_edges() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let root = add_root_node(&graph, statement("Root", "")).unwrap();
+    let other = add_root_node(&graph, statement("Other", "")).unwrap();
+    let child = add_child_node(&graph, &root, statement("Child", "")).unwrap();
+    link_existing_node(&graph, &other, &child).unwrap();
+
+    let index = rebuild_index(&graph).unwrap();
+
+    assert!(index.problems.is_empty());
+    assert_eq!(
+        index
+            .nodes
+            .iter()
+            .map(|node| node.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Child", "Other", "Root"]
+    );
+    assert!(
+        index
+            .edges
+            .iter()
+            .any(|edge| { edge.parent_id == root && edge.child_id == child && !edge.is_symlink })
+    );
+    assert!(
+        index
+            .edges
+            .iter()
+            .any(|edge| { edge.parent_id == other && edge.child_id == child && edge.is_symlink })
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn recursive_delete_removes_private_subtree_without_following_outside_symlink() {
+    let graph_temp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let outside_file = outside.path().join("keep.txt");
+    fs::write(&outside_file, "do not remove").unwrap();
+
+    let graph = init_graph(graph_temp.path()).unwrap();
+    let root = add_root_node(&graph, statement("Root", "")).unwrap();
+    let child = add_child_node(&graph, &root, statement("Child", "")).unwrap();
+    let grandchild = add_child_node(&graph, &child, statement("Grandchild", "")).unwrap();
+    let root_node = read_node(&graph, &root).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path(),
+        root_node
+            .canonical_path
+            .join("children")
+            .join("outside--550e8400-e29b-41d4-a716-446655440000"),
+    )
+    .unwrap();
+
+    assert!(
+        rebuild_index(&graph)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, GraphProblem::BrokenSymlink { .. }))
+    );
+
+    delete_node(&graph, &root, DeleteMode::Recursive).unwrap();
+
+    for id in [root, child, grandchild] {
+        assert!(matches!(
+            read_node(&graph, &id),
+            Err(GraphError::NodeNotFound(_))
+        ));
+    }
+    assert_eq!(fs::read_to_string(outside_file).unwrap(), "do not remove");
+}
+
+#[test]
+fn example_usage_from_spec_runs_as_documented() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+
+    let rust_id = add_root_node(
+        &graph,
+        NewNode {
+            kind: NodeKind::Statement,
+            title: "Rust keeps local tools simple".to_string(),
+            content: NodeContent::Statement {
+                body: "Rust can manage local files without a background service.".to_string(),
+            },
+        },
+    )
+    .unwrap();
+
+    let qa_id = add_child_node(
+        &graph,
+        &rust_id,
+        NewNode {
+            kind: NodeKind::QuestionAnswer,
+            title: "Why use symlinks?".to_string(),
+            content: NodeContent::QuestionAnswer {
+                question: "Why use symlinks for shared children?".to_string(),
+                answer:
+                    "They preserve one canonical Markdown file while allowing multiple parents."
+                        .to_string(),
+            },
+        },
+    )
+    .unwrap();
+
+    let descendants =
+        list_descendants(&graph, &rust_id, TraversalOptions { max_depth: None }).unwrap();
+
+    assert_eq!(descendants[0].id, qa_id);
+}
+
+#[test]
+fn multiple_open_graph_handles_can_read_the_same_graph() {
+    let temp = tempdir().unwrap();
+    let writer = init_graph(temp.path()).unwrap();
+    let id = add_root_node(&writer, statement("Root", "Readable")).unwrap();
+
+    let reader_one = open_graph(temp.path()).unwrap();
+    let reader_two = open_graph(temp.path()).unwrap();
+
+    assert_eq!(read_node(&reader_one, &id).unwrap().title, "Root");
+    assert_eq!(list_roots(&reader_two).unwrap()[0].id, id);
+}
+
+#[test]
+fn spec_traceability_table_points_each_section_to_tests() {
+    let spec = include_str!("../../../spec/SPEC.md");
+
+    assert!(spec.contains("## Spec Test Traceability"));
+    assert!(spec.contains("| Section | Unit tests | Integration tests |"));
+    for section in 1..=28 {
+        assert!(
+            spec.contains(&format!("| {section} |")),
+            "missing traceability row for spec section {section}"
+        );
+    }
 }
 
 fn copy_dir_all(source: impl AsRef<Path>, destination: impl AsRef<Path>) {

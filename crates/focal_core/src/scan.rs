@@ -458,3 +458,113 @@ pub(crate) fn summary_for(scan: &ScanResult, id: &str, is_alias: bool) -> Option
 pub(crate) fn node_id_from_entry_path(path: &Path) -> Option<String> {
     node_id_from_dir_name(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    const A_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const B_ID: &str = "7d9f2e5c-0f22-4c18-a0be-9f23e772a0bc";
+    const C_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn scanned(id: &str, title: &str, path: &str) -> ScannedNode {
+        ScannedNode {
+            id: id.to_string(),
+            kind: NodeKind::Statement,
+            title: title.to_string(),
+            content: NodeContent::Statement {
+                body: String::new(),
+            },
+            created_at_unix: 1,
+            updated_at_unix: 1,
+            canonical_paths: vec![PathBuf::from(path)],
+            alias_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn spec_13_and_24_cycle_detection_records_manual_cycles() {
+        let mut result = ScanResult {
+            nodes: BTreeMap::from([
+                (A_ID.to_string(), scanned(A_ID, "Alpha", "/graph/roots/a")),
+                (
+                    B_ID.to_string(),
+                    scanned(B_ID, "Beta", "/graph/roots/a/children/b"),
+                ),
+            ]),
+            edges: vec![
+                GraphEdge {
+                    parent_id: A_ID.to_string(),
+                    child_id: B_ID.to_string(),
+                    path: PathBuf::from("/graph/roots/a/children/b"),
+                    is_symlink: false,
+                },
+                GraphEdge {
+                    parent_id: B_ID.to_string(),
+                    child_id: A_ID.to_string(),
+                    path: PathBuf::from("/graph/roots/a/children/b/children/a"),
+                    is_symlink: true,
+                },
+            ],
+            root_entries: Vec::new(),
+            broken_symlinks: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        detect_cycles(&mut result);
+
+        assert!(result.problems.iter().any(|problem| {
+            matches!(problem, GraphProblem::CycleDetected { node_id } if node_id == A_ID || node_id == B_ID)
+        }));
+    }
+
+    #[test]
+    fn spec_19_graph_index_sorts_nodes_and_edges_for_deterministic_discovery() {
+        let result = ScanResult {
+            nodes: BTreeMap::from([
+                (B_ID.to_string(), scanned(B_ID, "Beta", "/graph/roots/b")),
+                (A_ID.to_string(), scanned(A_ID, "Alpha", "/graph/roots/a")),
+                (C_ID.to_string(), scanned(C_ID, "Alpha", "/graph/roots/c")),
+            ]),
+            edges: vec![
+                GraphEdge {
+                    parent_id: B_ID.to_string(),
+                    child_id: C_ID.to_string(),
+                    path: PathBuf::from("/graph/roots/b/children/c"),
+                    is_symlink: true,
+                },
+                GraphEdge {
+                    parent_id: A_ID.to_string(),
+                    child_id: B_ID.to_string(),
+                    path: PathBuf::from("/graph/roots/a/children/b"),
+                    is_symlink: false,
+                },
+            ],
+            root_entries: Vec::new(),
+            broken_symlinks: Vec::new(),
+            problems: Vec::new(),
+        };
+
+        let index = graph_index(&result);
+
+        assert_eq!(
+            index
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![C_ID, A_ID, B_ID]
+        );
+        assert_eq!(
+            index
+                .edges
+                .iter()
+                .map(|edge| (edge.parent_id.as_str(), edge.child_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(A_ID, B_ID), (B_ID, C_ID)]
+        );
+    }
+}

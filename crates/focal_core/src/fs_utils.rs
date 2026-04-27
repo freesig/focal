@@ -272,3 +272,125 @@ pub(crate) fn has_node_dir_suffix(path: &Path, id: &str) -> bool {
         .and_then(|name| name.rsplit_once("--").map(|(_, suffix)| suffix))
         .is_some_and(|suffix| suffix == id)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    const VALID_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn spec_06_directory_names_use_readable_unique_slugs_and_authoritative_ids() {
+        let temp = tempdir().unwrap();
+        let container = temp.path().join("children");
+        fs::create_dir_all(&container).unwrap();
+
+        assert_eq!(
+            slugify(" Why Rust for local graphs? "),
+            "why-rust-for-local-graphs"
+        );
+        assert_eq!(slugify("!!!"), "node");
+
+        let first = unique_node_path(&container, "Why Rust?", VALID_ID).unwrap();
+        assert!(first.ends_with(format!("why-rust--{VALID_ID}")));
+        fs::create_dir_all(&first).unwrap();
+
+        let second = unique_node_path(&container, "Why Rust?", VALID_ID).unwrap();
+        assert!(second.ends_with(format!("why-rust-2--{VALID_ID}")));
+        assert_eq!(node_id_from_dir_name(&second).as_deref(), Some(VALID_ID));
+        assert!(has_node_dir_suffix(&second, VALID_ID));
+    }
+
+    #[test]
+    fn spec_07_node_id_validation_accepts_uuid_strings_only() {
+        validate_node_id(VALID_ID).unwrap();
+
+        for invalid in [
+            "../550e8400-e29b-41d4-a716-446655440000",
+            "550E8400-e29b-41d4-a716-446655440000",
+            ".",
+            "con",
+            "550e8400/e29b/41d4/a716/446655440000",
+            "550e8400-e29b-41d4-a716-446655440000\n",
+        ] {
+            assert!(matches!(
+                validate_node_id(invalid),
+                Err(GraphError::InvalidNodeId(id)) if id == invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn spec_21_atomic_write_replaces_contents_without_temp_files() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("node.md");
+
+        write_file_atomically(&root, &path, "first").unwrap();
+        write_file_atomically(&root, &path, "second").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        let leftovers = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".node.md."))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn spec_18_safe_rename_moves_directories_inside_graph_root() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let from = root.join("roots").join(format!("from--{VALID_ID}"));
+        let to = root.join("roots").join(format!("to--{VALID_ID}"));
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join("node.md"), "content").unwrap();
+
+        safe_rename(&root, &from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(to.join("node.md")).unwrap(), "content");
+    }
+
+    #[test]
+    fn spec_25_safe_remove_rejects_paths_outside_graph_root() {
+        let graph = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = graph.path().canonicalize().unwrap();
+
+        assert!(matches!(
+            safe_remove_dir_all(&root, outside.path()),
+            Err(GraphError::PermissionDenied(path)) if path == outside.path()
+        ));
+        assert!(outside.path().exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spec_05_and_23_symlinks_are_relative_directory_links_inside_graph() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let target = root.join("roots").join(format!("target--{VALID_ID}"));
+        let link_parent = root
+            .join("roots")
+            .join("parent--7d9f2e5c-0f22-4c18-a0be-9f23e772a0bc")
+            .join("children");
+        let link = link_parent.join(format!("target--{VALID_ID}"));
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&link_parent).unwrap();
+
+        create_relative_dir_symlink(&root, &target, &link).unwrap();
+
+        let target_path = fs::read_link(&link).unwrap();
+        assert!(target_path.is_relative());
+        assert_eq!(
+            resolve_symlink_path(&link).unwrap().canonicalize().unwrap(),
+            target
+        );
+    }
+}

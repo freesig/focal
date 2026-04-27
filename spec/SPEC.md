@@ -797,6 +797,41 @@ Safety:
 - Reject symlink targets outside graph root.
 - Never delete outside graph root.
 
+## Spec Test Traceability
+
+Each row points to at least one in-crate unit test and one public API integration test for the numbered section.
+
+| Section | Unit tests | Integration tests |
+|---|---|---|
+| 1 | `crates/focal_core/src/lib.rs::tests::spec_01_02_03_and_22_crate_surface_stays_dependency_light_library_only` | `crates/focal_core/tests/graph.rs::example_usage_from_spec_runs_as_documented` |
+| 2 | `crates/focal_core/src/lib.rs::tests::spec_01_02_03_and_22_crate_surface_stays_dependency_light_library_only` | `crates/focal_core/tests/graph.rs::init_open_add_read_and_update_nodes` |
+| 3 | `crates/focal_core/src/lib.rs::tests::spec_01_02_03_and_22_crate_surface_stays_dependency_light_library_only` | `crates/focal_core/tests/graph.rs::example_usage_from_spec_runs_as_documented` |
+| 4 | `crates/focal_core/src/model.rs::tests::spec_09_model_types_are_plain_constructible_values` | `crates/focal_core/tests/graph.rs::linking_is_idempotent_and_rejects_cycles` |
+| 5 | `crates/focal_core/src/fs_utils.rs::tests::spec_05_and_23_symlinks_are_relative_directory_links_inside_graph` | `crates/focal_core/tests/graph.rs::init_open_add_read_and_update_nodes` |
+| 6 | `crates/focal_core/src/fs_utils.rs::tests::spec_06_directory_names_use_readable_unique_slugs_and_authoritative_ids` | `crates/focal_core/tests/graph.rs::broken_symlink_name_is_not_reused_for_new_link` |
+| 7 | `crates/focal_core/src/fs_utils.rs::tests::spec_07_node_id_validation_accepts_uuid_strings_only` | `crates/focal_core/tests/graph.rs::rejects_invalid_inputs_and_ids` |
+| 8 | `crates/focal_core/src/markdown.rs::tests::spec_08_statement_markdown_round_trips_without_heading_management`<br>`crates/focal_core/src/markdown.rs::tests::spec_08_question_answer_markdown_requires_managed_sections` | `crates/focal_core/tests/graph.rs::root_and_child_question_answer_nodes_support_empty_answers`<br>`crates/focal_core/tests/graph.rs::question_answer_updates_keep_identity_paths_and_managed_sections` |
+| 9 | `crates/focal_core/src/model.rs::tests::spec_09_model_types_are_plain_constructible_values` | `crates/focal_core/tests/graph.rs::example_usage_from_spec_runs_as_documented` |
+| 10 | `crates/focal_core/src/lib.rs::tests::spec_01_02_03_and_22_crate_surface_stays_dependency_light_library_only` | `crates/focal_core/tests/graph.rs::example_usage_from_spec_runs_as_documented` |
+| 11 | `crates/focal_core/src/model.rs::tests::spec_11_delete_and_orphan_modes_are_copyable_contract_values` | `crates/focal_core/tests/graph.rs::delete_modes_handle_leaf_and_non_leaf_nodes`<br>`crates/focal_core/tests/graph.rs::unlink_orphan_policies_move_fail_and_delete` |
+| 12 | `crates/focal_core/src/fs_utils.rs::tests::spec_05_and_23_symlinks_are_relative_directory_links_inside_graph` | `crates/focal_core/tests/graph.rs::linking_is_idempotent_and_rejects_cycles`<br>`crates/focal_core/tests/graph.rs::promotion_chooses_first_alias_and_rewrites_remaining_aliases` |
+| 13 | `crates/focal_core/src/scan.rs::tests::spec_13_and_24_cycle_detection_records_manual_cycles` | `crates/focal_core/tests/graph.rs::linking_is_idempotent_and_rejects_cycles`<br>`crates/focal_core/tests/graph.rs::ancestors_descendants_deduplicate_shared_paths_and_ignore_manual_cycle_start` |
+| 14 | `crates/focal_core/src/model.rs::tests::spec_14_traversal_options_default_has_no_depth_limit` | `crates/focal_core/tests/graph.rs::question_answer_nodes_and_traversal_are_deterministic`<br>`crates/focal_core/tests/graph.rs::ancestors_descendants_deduplicate_shared_paths_and_ignore_manual_cycle_start` |
+| 15 | `crates/focal_core/src/markdown.rs::tests::spec_08_statement_markdown_round_trips_without_heading_management` | `crates/focal_core/tests/graph.rs::init_open_add_read_and_update_nodes`<br>`crates/focal_core/tests/graph.rs::question_answer_updates_keep_identity_paths_and_managed_sections` |
+| 16 | `crates/focal_core/src/fs_utils.rs::tests::spec_06_directory_names_use_readable_unique_slugs_and_authoritative_ids` | `crates/focal_core/tests/graph.rs::root_and_child_question_answer_nodes_support_empty_answers`<br>`crates/focal_core/tests/graph.rs::rejects_invalid_inputs_and_ids` |
+| 17 | `crates/focal_core/src/scan.rs::tests::spec_19_graph_index_sorts_nodes_and_edges_for_deterministic_discovery` | `crates/focal_core/tests/graph.rs::init_open_add_read_and_update_nodes`<br>`crates/focal_core/tests/graph.rs::linking_is_idempotent_and_rejects_cycles` |
+| 18 | `crates/focal_core/src/fs_utils.rs::tests::spec_18_safe_rename_moves_directories_inside_graph_root` | `crates/focal_core/tests/graph.rs::unlinking_canonical_parent_promotes_alias_and_preserves_subtree`<br>`crates/focal_core/tests/graph.rs::promotion_chooses_first_alias_and_rewrites_remaining_aliases` |
+| 19 | `crates/focal_core/src/model.rs::tests::spec_19_index_edge_and_problem_types_are_constructible`<br>`crates/focal_core/src/scan.rs::tests::spec_19_graph_index_sorts_nodes_and_edges_for_deterministic_discovery` | `crates/focal_core/tests/graph.rs::rebuild_index_reports_sorted_nodes_edges_and_alias_edges` |
+| 20 | `crates/focal_core/src/error.rs::tests::spec_20_graph_error_display_and_source_preserve_io_error`<br>`crates/focal_core/src/error.rs::tests::spec_20_path_errors_include_repair_context` | `crates/focal_core/tests/graph.rs::rejects_invalid_inputs_and_ids`<br>`crates/focal_core/tests/graph.rs::duplicate_canonical_errors_are_preserved` |
+| 21 | `crates/focal_core/src/fs_utils.rs::tests::spec_21_atomic_write_replaces_contents_without_temp_files` | `crates/focal_core/tests/graph.rs::init_open_add_read_and_update_nodes` |
+| 22 | `crates/focal_core/src/lib.rs::tests::spec_01_02_03_and_22_crate_surface_stays_dependency_light_library_only` | `crates/focal_core/tests/graph.rs::multiple_open_graph_handles_can_read_the_same_graph` |
+| 23 | `crates/focal_core/src/fs_utils.rs::tests::spec_05_and_23_symlinks_are_relative_directory_links_inside_graph` | `crates/focal_core/tests/graph.rs::symlink_targets_outside_graph_are_rejected` |
+| 24 | `crates/focal_core/src/scan.rs::tests::spec_13_and_24_cycle_detection_records_manual_cycles` | `crates/focal_core/tests/graph.rs::validation_reports_manual_filesystem_problems`<br>`crates/focal_core/tests/graph.rs::validation_rejects_bad_directory_suffix_and_duplicate_metadata` |
+| 25 | `crates/focal_core/src/fs_utils.rs::tests::spec_25_safe_remove_rejects_paths_outside_graph_root` | `crates/focal_core/tests/graph.rs::symlink_targets_outside_graph_are_rejected`<br>`crates/focal_core/tests/graph.rs::recursive_delete_removes_private_subtree_without_following_outside_symlink` |
+| 26 | `crates/focal_core/src/lib.rs::tests::spec_26_spec_tracks_unit_and_integration_test_traceability` | `crates/focal_core/tests/graph.rs::spec_traceability_table_points_each_section_to_tests` |
+| 27 | `crates/focal_core/src/model.rs::tests::spec_09_model_types_are_plain_constructible_values` | `crates/focal_core/tests/graph.rs::example_usage_from_spec_runs_as_documented` |
+| 28 | `crates/focal_core/src/lib.rs::tests::spec_01_02_03_and_22_crate_surface_stays_dependency_light_library_only` | `crates/focal_core/tests/graph.rs::example_usage_from_spec_runs_as_documented`<br>`crates/focal_core/tests/graph.rs::rebuild_index_reports_sorted_nodes_edges_and_alias_edges` |
+
 ## 27. Example Usage
 
 ```rust

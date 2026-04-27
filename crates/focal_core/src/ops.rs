@@ -636,7 +636,7 @@ fn traverse(
     }
 
     let mut results = Vec::new();
-    let mut visited = BTreeSet::new();
+    let mut visited = BTreeSet::from([node_id.to_string()]);
     let mut queue = VecDeque::new();
     for neighbor in sorted_neighbors(&scan, node_id, direction)? {
         queue.push_back((neighbor.id.clone(), neighbor, 1usize));
