@@ -490,6 +490,22 @@ fn validation_rejects_bad_directory_suffix_and_duplicate_metadata() {
 }
 
 #[test]
+fn list_roots_surfaces_root_level_validation_problems() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let malformed = add_root_node(&graph, statement("Malformed", "")).unwrap();
+    let malformed_node = read_node(&graph, &malformed).unwrap();
+    let node_file = malformed_node.canonical_path.join("node.md");
+
+    fs::write(&node_file, "not front matter").unwrap();
+
+    assert!(matches!(
+        list_roots(&graph),
+        Err(GraphError::InvalidMarkdown { path, .. }) if path == node_file
+    ));
+}
+
+#[test]
 #[cfg(unix)]
 fn symlink_targets_outside_graph_are_rejected() {
     let temp = tempdir().unwrap();
@@ -602,6 +618,10 @@ fn symlinked_roots_directory_is_rejected_before_scanning_or_writing() {
     fs::remove_dir_all(&roots).unwrap();
     std::os::unix::fs::symlink(outside.path().join("roots"), &roots).unwrap();
 
+    assert!(matches!(
+        init_graph(graph_temp.path()),
+        Err(GraphError::InvalidGraphRoot(_))
+    ));
     assert!(matches!(
         list_roots(&graph),
         Err(GraphError::InvalidGraphRoot(_))

@@ -23,6 +23,12 @@ use crate::scan::{
 pub fn init_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError> {
     let root = crate::fs_utils::absolute_path(root.as_ref())?;
     fs::create_dir_all(roots_path(&root))?;
+    if !real_dir_exists(&roots_path(&root))? {
+        return Err(GraphError::InvalidGraphRoot(format!(
+            "{} does not contain a real roots/ directory",
+            root.display()
+        )));
+    }
     let root = root.canonicalize()?;
     Ok(IdeaGraph { root })
 }
@@ -220,6 +226,9 @@ pub fn unlink_child(
 
 pub fn list_roots(graph: &IdeaGraph) -> Result<Vec<NodeSummary>, GraphError> {
     let scan = scan_graph(graph)?;
+    if let Some(error) = problem_error_under_container(&scan, &roots_path(&graph.root)) {
+        return Err(error);
+    }
     let mut by_id = BTreeMap::new();
     for entry in &scan.root_entries {
         if let Some(summary) = summary_for(&scan, &entry.id, entry.is_symlink) {
