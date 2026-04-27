@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GraphError;
 use crate::fs_utils::{
-    children_path, create_relative_dir_symlink, generate_node_id, is_path_inside_any,
-    node_file_path, now_unix, path_sort_key, roots_path, safe_remove_dir_all, safe_remove_file,
-    safe_rename, unique_node_path, validate_node_id, validate_title, write_file_atomically,
+    NODE_FILE, children_path, create_relative_dir_symlink, ensure_real_dir_inside,
+    generate_node_id, is_path_inside_any, node_file_path, now_unix, path_sort_key, real_dir_exists,
+    roots_path, safe_remove_dir_all, safe_remove_file, safe_rename, unique_node_path,
+    validate_node_id, validate_title, write_file_atomically,
 };
 use crate::markdown::render_node_markdown;
 use crate::model::{
@@ -28,7 +29,7 @@ pub fn init_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError> {
 
 pub fn open_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError> {
     let root = crate::fs_utils::canonicalize_existing(root.as_ref())?;
-    if !roots_path(&root).is_dir() {
+    if !real_dir_exists(&roots_path(&root))? {
         return Err(GraphError::InvalidGraphRoot(format!(
             "{} does not contain roots/",
             root.display()
@@ -53,7 +54,7 @@ pub fn add_child_node(
     let parent_path =
         canonical_path(parent).ok_or_else(|| GraphError::ParentNotFound(parent_id.to_string()))?;
     let container = children_path(parent_path);
-    if !container.is_dir() {
+    if !real_dir_exists(&container)? {
         return Err(GraphError::MissingChildrenDirectory(
             parent_path.to_path_buf(),
         ));
@@ -156,7 +157,7 @@ pub fn link_existing_node(
     let child_path =
         canonical_path(child).ok_or_else(|| GraphError::ChildNotFound(child_id.to_string()))?;
     let container = children_path(parent_path);
-    if !container.is_dir() {
+    if !real_dir_exists(&container)? {
         return Err(GraphError::MissingChildrenDirectory(
             parent_path.to_path_buf(),
         ));
@@ -313,9 +314,9 @@ fn create_node_in_container(
     node: NewNode,
 ) -> Result<NodeId, GraphError> {
     validate_new_node(&node, &graph.root)?;
-    fs::create_dir_all(container)?;
 
     let scan = scan_graph(graph)?;
+    ensure_real_dir_inside(&graph.root, container)?;
     let id = loop {
         let id = generate_node_id();
         if !scan.nodes.contains_key(&id) {
@@ -695,10 +696,20 @@ fn sorted_neighbors(
 fn broken_symlink_for_id(scan: &ScanResult, node_id: &str) -> Option<PathBuf> {
     scan.problems.iter().find_map(|problem| match problem {
         crate::model::GraphProblem::BrokenSymlink { path }
-            if crate::scan::node_id_from_entry_path(path).as_deref() == Some(node_id) =>
+            if problem_path_node_id(path).as_deref() == Some(node_id) =>
         {
             Some(path.clone())
         }
         _ => None,
     })
+}
+
+fn problem_path_node_id(path: &Path) -> Option<String> {
+    if let Some(id) = crate::scan::node_id_from_entry_path(path) {
+        return Some(id);
+    }
+    if path.file_name().and_then(|name| name.to_str()) == Some(NODE_FILE) {
+        return path.parent().and_then(crate::scan::node_id_from_entry_path);
+    }
+    None
 }

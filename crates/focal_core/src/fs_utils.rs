@@ -123,6 +123,43 @@ pub(crate) fn canonicalize_existing(path: &Path) -> Result<PathBuf, GraphError> 
     path.canonicalize().map_err(GraphError::Io)
 }
 
+pub(crate) fn real_dir_exists(path: &Path) -> Result<bool, GraphError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(GraphError::Io(error)),
+    }
+}
+
+pub(crate) fn real_file_exists(path: &Path) -> Result<bool, GraphError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(GraphError::Io(error)),
+    }
+}
+
+pub(crate) fn is_symlink(path: &Path) -> Result<bool, GraphError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(GraphError::Io(error)),
+    }
+}
+
+pub(crate) fn ensure_real_dir_inside(root: &Path, path: &Path) -> Result<(), GraphError> {
+    if !real_dir_exists(path)? {
+        return Err(GraphError::PermissionDenied(path.to_path_buf()));
+    }
+
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(root) {
+        return Err(GraphError::PermissionDenied(path.to_path_buf()));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf, GraphError> {
     if path.is_absolute() {
         Ok(path.to_path_buf())

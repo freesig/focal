@@ -457,6 +457,99 @@ fn symlink_targets_outside_graph_are_rejected() {
 }
 
 #[test]
+#[cfg(unix)]
+fn symlinked_roots_directory_is_rejected_before_scanning_or_writing() {
+    let graph_temp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let graph = init_graph(graph_temp.path()).unwrap();
+    let outside_graph = init_graph(outside.path()).unwrap();
+    let outside_id = add_root_node(&outside_graph, statement("Outside", "secret")).unwrap();
+    let roots = graph_temp.path().join("roots");
+
+    fs::remove_dir_all(&roots).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("roots"), &roots).unwrap();
+
+    assert!(matches!(
+        list_roots(&graph),
+        Err(GraphError::InvalidGraphRoot(_))
+    ));
+    assert!(matches!(
+        add_root_node(&graph, statement("Should Not Escape", "")),
+        Err(GraphError::InvalidGraphRoot(_))
+    ));
+    assert_eq!(
+        fs::read_dir(outside.path().join("roots")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        read_node(&outside_graph, &outside_id).unwrap().title,
+        "Outside"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn symlinked_children_directory_is_not_scanned_or_written_through() {
+    let graph_temp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let graph = init_graph(graph_temp.path()).unwrap();
+    let outside_graph = init_graph(outside.path()).unwrap();
+    let outside_id = add_root_node(&outside_graph, statement("Outside", "secret")).unwrap();
+    let root = add_root_node(&graph, statement("Root", "")).unwrap();
+    let root_node = read_node(&graph, &root).unwrap();
+    let children = root_node.canonical_path.join("children");
+
+    fs::remove_dir_all(&children).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("roots"), &children).unwrap();
+
+    let index = rebuild_index(&graph).unwrap();
+    assert!(
+        index
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, GraphProblem::MissingChildrenDirectory { path } if path == &root_node.canonical_path))
+    );
+    assert!(!index.nodes.iter().any(|node| node.id == outside_id));
+    assert!(list_children(&graph, &root).unwrap().is_empty());
+    assert!(matches!(
+        add_child_node(&graph, &root, statement("Should Not Escape", "")),
+        Err(GraphError::MissingChildrenDirectory(path)) if path == root_node.canonical_path
+    ));
+    assert_eq!(
+        fs::read_dir(outside.path().join("roots")).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn symlinked_node_markdown_is_not_read_from_outside_graph() {
+    let graph_temp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let graph = init_graph(graph_temp.path()).unwrap();
+    let root = add_root_node(&graph, statement("Root", "internal body")).unwrap();
+    let root_node = read_node(&graph, &root).unwrap();
+    let node_file = root_node.canonical_path.join("node.md");
+    let outside_file = outside.path().join("outside.md");
+    let outside_markdown = fs::read_to_string(&node_file)
+        .unwrap()
+        .replace("title: Root", "title: Outside")
+        .replace("internal body", "outside body");
+
+    fs::write(&outside_file, outside_markdown).unwrap();
+    fs::remove_file(&node_file).unwrap();
+    std::os::unix::fs::symlink(&outside_file, &node_file).unwrap();
+
+    assert!(matches!(
+        read_node(&graph, &root),
+        Err(GraphError::BrokenSymlink(path)) if path == node_file
+    ));
+    assert!(rebuild_index(&graph).unwrap().problems.iter().any(
+        |problem| matches!(problem, GraphProblem::BrokenSymlink { path } if path == &node_file)
+    ));
+}
+
+#[test]
 fn promotion_chooses_first_alias_and_rewrites_remaining_aliases() {
     let temp = tempdir().unwrap();
     let graph = init_graph(temp.path()).unwrap();

@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GraphError;
 use crate::fs_utils::{
-    children_path, has_node_dir_suffix, node_file_path, node_id_from_dir_name,
-    resolve_symlink_path, roots_path, validate_node_id, validate_title,
+    children_path, has_node_dir_suffix, node_file_path, node_id_from_dir_name, real_dir_exists,
+    real_file_exists, resolve_symlink_path, roots_path, validate_node_id, validate_title,
 };
 use crate::markdown::{ParsedMarkdown, parse_node_markdown};
 use crate::model::{
@@ -140,7 +140,7 @@ pub(crate) fn graph_index(scan: &ScanResult) -> GraphIndex {
 
 pub(crate) fn scan_graph(graph: &IdeaGraph) -> Result<ScanResult, GraphError> {
     let roots = roots_path(&graph.root);
-    if !roots.is_dir() {
+    if !real_dir_exists(&roots)? {
         return Err(GraphError::InvalidGraphRoot(format!(
             "{} does not contain roots/",
             graph.root.display()
@@ -228,7 +228,7 @@ fn scan_real_node_dir(
     }
 
     let children = children_path(node_dir);
-    if children.is_dir() {
+    if real_dir_exists(&children)? {
         scan_container(scanner, &children, Some(&id))?;
     }
 
@@ -285,7 +285,13 @@ fn parse_real_node_dir(
     node_dir: &Path,
 ) -> Result<Option<ParsedMarkdown>, GraphError> {
     let node_file = node_file_path(node_dir);
-    if !node_file.is_file() {
+    if !real_file_exists(&node_file)? {
+        if crate::fs_utils::is_symlink(&node_file)? {
+            result
+                .problems
+                .push(GraphProblem::BrokenSymlink { path: node_file });
+            return Ok(None);
+        }
         result.problems.push(GraphProblem::MissingNodeMarkdown {
             path: node_dir.to_path_buf(),
         });
@@ -329,7 +335,7 @@ fn parse_real_node_dir(
     }
 
     let children = children_path(node_dir);
-    if !children.is_dir() {
+    if !real_dir_exists(&children)? {
         result
             .problems
             .push(GraphProblem::MissingChildrenDirectory {
