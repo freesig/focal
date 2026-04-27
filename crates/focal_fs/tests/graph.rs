@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use focal_core::{
+use focal_fs::{
     DeleteMode, GraphError, GraphProblem, NewNode, NodeContent, NodeKind, NodePatch, OrphanPolicy,
     TraversalOptions, add_child_node, add_root_node, delete_node, init_graph, link_existing_node,
     list_ancestors, list_children, list_descendants, list_parents, list_roots, open_graph,
