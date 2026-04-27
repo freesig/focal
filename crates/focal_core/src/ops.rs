@@ -68,6 +68,9 @@ pub fn read_node(graph: &IdeaGraph, node_id: &str) -> Result<Node, GraphError> {
     let node = match canonical_node(&scan, node_id) {
         Ok(node) => node,
         Err(GraphError::NodeNotFound(_)) => {
+            if let Some(error) = corrupt_node_error_for_id(&scan, node_id) {
+                return Err(error);
+            }
             if let Some(path) = broken_symlink_for_id(&scan, node_id) {
                 return Err(GraphError::BrokenSymlink(path));
             }
@@ -208,12 +211,12 @@ pub fn unlink_child(
             .map(|edge| edge.path.clone())
             .min_by_key(|path| path_sort_key(path))
             .ok_or_else(|| GraphError::AliasConflict(edge.path.clone()))?;
-        promote_to_alias(graph, child, &alias_path)?;
+        promote_to_alias(graph, &scan, child, &alias_path)?;
         return Ok(());
     }
 
     if orphan_policy == OrphanPolicy::MoveToRoots {
-        move_node_to_roots(graph, child)?;
+        move_node_to_roots(graph, &scan, child)?;
         return Ok(());
     }
 
@@ -471,7 +474,7 @@ fn perform_delete_set(
 
     for (id, alias_path) in promotion_targets_for_delete(scan, delete_set, &delete_paths) {
         let node = canonical_node(scan, &id)?;
-        promote_to_alias(graph, node, &alias_path)?;
+        promote_to_alias(graph, scan, node, &alias_path)?;
     }
 
     for id in delete_set {
@@ -567,38 +570,106 @@ fn promotion_targets_for_delete(
 
 fn promote_to_alias(
     graph: &IdeaGraph,
+    scan: &ScanResult,
     node: &ScannedNode,
     new_canonical_path: &Path,
 ) -> Result<(), GraphError> {
     let old_canonical_path =
         canonical_path(node).ok_or_else(|| GraphError::NodeNotFound(node.id.clone()))?;
+    let symlink_rewrites = symlink_rewrites_for_subtree_move(
+        scan,
+        old_canonical_path,
+        new_canonical_path,
+        Some(new_canonical_path),
+    );
     safe_remove_file(&graph.root, new_canonical_path)?;
     safe_rename(&graph.root, old_canonical_path, new_canonical_path)?;
 
-    for alias_path in &node.alias_paths {
-        if alias_path == new_canonical_path {
-            continue;
-        }
-        rewrite_existing_alias(graph, alias_path, new_canonical_path)?;
+    for rewrite in symlink_rewrites {
+        rewrite_existing_alias(graph, &rewrite.link_path, &rewrite.target_path)?;
     }
 
     Ok(())
 }
 
-fn move_node_to_roots(graph: &IdeaGraph, node: &ScannedNode) -> Result<(), GraphError> {
+fn move_node_to_roots(
+    graph: &IdeaGraph,
+    scan: &ScanResult,
+    node: &ScannedNode,
+) -> Result<(), GraphError> {
     let old_canonical_path =
         canonical_path(node).ok_or_else(|| GraphError::NodeNotFound(node.id.clone()))?;
     if old_canonical_path.parent() == Some(roots_path(&graph.root).as_path()) {
         return Ok(());
     }
     let target = unique_node_path(&roots_path(&graph.root), &node.title, &node.id)?;
+    let symlink_rewrites =
+        symlink_rewrites_for_subtree_move(scan, old_canonical_path, &target, None);
     safe_rename(&graph.root, old_canonical_path, &target)?;
 
-    for alias_path in &node.alias_paths {
-        rewrite_existing_alias(graph, alias_path, &target)?;
+    for rewrite in symlink_rewrites {
+        rewrite_existing_alias(graph, &rewrite.link_path, &rewrite.target_path)?;
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct SymlinkRewrite {
+    link_path: PathBuf,
+    target_path: PathBuf,
+}
+
+fn symlink_rewrites_for_subtree_move(
+    scan: &ScanResult,
+    old_subtree_path: &Path,
+    new_subtree_path: &Path,
+    skipped_link_path: Option<&Path>,
+) -> Vec<SymlinkRewrite> {
+    let mut rewrites = Vec::new();
+
+    for target_node in scan.nodes.values() {
+        let Some(target_path) = canonical_path(target_node) else {
+            continue;
+        };
+        for alias_path in &target_node.alias_paths {
+            if skipped_link_path.is_some_and(|skipped| alias_path == skipped) {
+                continue;
+            }
+
+            let moved_link_path =
+                path_after_subtree_move(alias_path, old_subtree_path, new_subtree_path);
+            let moved_target_path =
+                path_after_subtree_move(target_path, old_subtree_path, new_subtree_path);
+            if moved_link_path.as_path() == alias_path && moved_target_path.as_path() == target_path
+            {
+                continue;
+            }
+
+            rewrites.push(SymlinkRewrite {
+                link_path: moved_link_path,
+                target_path: moved_target_path,
+            });
+        }
+    }
+
+    rewrites.sort_by(|left, right| {
+        path_sort_key(&left.link_path)
+            .cmp(&path_sort_key(&right.link_path))
+            .then(path_sort_key(&left.target_path).cmp(&path_sort_key(&right.target_path)))
+    });
+    rewrites
+}
+
+fn path_after_subtree_move(
+    path: &Path,
+    old_subtree_path: &Path,
+    new_subtree_path: &Path,
+) -> PathBuf {
+    match path.strip_prefix(old_subtree_path) {
+        Ok(relative) => new_subtree_path.join(relative),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 fn rewrite_existing_alias(
@@ -699,6 +770,25 @@ fn broken_symlink_for_id(scan: &ScanResult, node_id: &str) -> Option<PathBuf> {
             if problem_path_node_id(path).as_deref() == Some(node_id) =>
         {
             Some(path.clone())
+        }
+        _ => None,
+    })
+}
+
+fn corrupt_node_error_for_id(scan: &ScanResult, node_id: &str) -> Option<GraphError> {
+    scan.problems.iter().find_map(|problem| match problem {
+        crate::model::GraphProblem::MissingNodeMarkdown { path }
+            if problem_path_node_id(path).as_deref() == Some(node_id) =>
+        {
+            Some(GraphError::MissingNodeMarkdown(path.clone()))
+        }
+        crate::model::GraphProblem::InvalidMarkdown { path, reason }
+            if problem_path_node_id(path).as_deref() == Some(node_id) =>
+        {
+            Some(GraphError::InvalidMarkdown {
+                path: path.clone(),
+                reason: reason.clone(),
+            })
         }
         _ => None,
     })

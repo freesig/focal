@@ -347,6 +347,29 @@ fn validation_reports_manual_filesystem_problems() {
 }
 
 #[test]
+fn read_node_surfaces_corrupt_existing_node_files() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let missing = add_root_node(&graph, statement("Missing Markdown", "")).unwrap();
+    let invalid = add_root_node(&graph, statement("Invalid Markdown", "")).unwrap();
+    let missing_node = read_node(&graph, &missing).unwrap();
+    let invalid_node = read_node(&graph, &invalid).unwrap();
+    let invalid_node_file = invalid_node.canonical_path.join("node.md");
+
+    fs::remove_file(missing_node.canonical_path.join("node.md")).unwrap();
+    fs::write(&invalid_node_file, "not front matter").unwrap();
+
+    assert!(matches!(
+        read_node(&graph, &missing),
+        Err(GraphError::MissingNodeMarkdown(path)) if path == missing_node.canonical_path
+    ));
+    assert!(matches!(
+        read_node(&graph, &invalid),
+        Err(GraphError::InvalidMarkdown { path, .. }) if path == invalid_node_file
+    ));
+}
+
+#[test]
 fn rejects_invalid_inputs_and_ids() {
     let temp = tempdir().unwrap();
     let graph = init_graph(temp.path()).unwrap();
@@ -579,6 +602,89 @@ fn promotion_chooses_first_alias_and_rewrites_remaining_aliases() {
     assert_eq!(
         resolved.canonicalize().unwrap(),
         expected_canonical.canonicalize().unwrap()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn promotion_rewrites_symlinks_inside_and_pointing_into_moved_subtree() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let old_parent = add_root_node(&graph, statement("Old Parent", "")).unwrap();
+    let deep_root = add_root_node(&graph, statement("Deep Root", "")).unwrap();
+    let deep_parent = add_child_node(&graph, &deep_root, statement("Deep Parent", "")).unwrap();
+    let outside_parent = add_root_node(&graph, statement("Outside Parent", "")).unwrap();
+    let external = add_root_node(&graph, statement("External", "")).unwrap();
+    let child = add_child_node(&graph, &old_parent, statement("Child", "")).unwrap();
+    let grandchild = add_child_node(&graph, &child, statement("Grandchild", "")).unwrap();
+
+    link_existing_node(&graph, &child, &external).unwrap();
+    link_existing_node(&graph, &outside_parent, &grandchild).unwrap();
+    link_existing_node(&graph, &deep_parent, &child).unwrap();
+
+    unlink_child(&graph, &old_parent, &child, OrphanPolicy::MoveToRoots).unwrap();
+
+    assert!(
+        list_children(&graph, &child)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == external && node.is_alias)
+    );
+    assert!(
+        list_children(&graph, &outside_parent)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == grandchild && node.is_alias)
+    );
+    assert!(
+        !rebuild_index(&graph)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, GraphProblem::BrokenSymlink { .. }))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn move_to_roots_rewrites_symlinks_inside_and_pointing_into_moved_subtree() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let old_parent = add_root_node(&graph, statement("Old Parent", "")).unwrap();
+    let outside_parent = add_root_node(&graph, statement("Outside Parent", "")).unwrap();
+    let external = add_root_node(&graph, statement("External", "")).unwrap();
+    let child = add_child_node(&graph, &old_parent, statement("Child", "")).unwrap();
+    let grandchild = add_child_node(&graph, &child, statement("Grandchild", "")).unwrap();
+
+    link_existing_node(&graph, &child, &external).unwrap();
+    link_existing_node(&graph, &outside_parent, &grandchild).unwrap();
+
+    unlink_child(&graph, &old_parent, &child, OrphanPolicy::MoveToRoots).unwrap();
+
+    assert!(
+        list_roots(&graph)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == child && !node.is_alias)
+    );
+    assert!(
+        list_children(&graph, &child)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == external && node.is_alias)
+    );
+    assert!(
+        list_children(&graph, &outside_parent)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == grandchild && node.is_alias)
+    );
+    assert!(
+        !rebuild_index(&graph)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, GraphProblem::BrokenSymlink { .. }))
     );
 }
 
