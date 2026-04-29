@@ -13,6 +13,8 @@ Two storage crates are specified:
 
 A shared `focal-types` crate contains the common public data types used by both storage crates.
 
+A `focal-core` crate provides the unified public API for applications that want to choose a storage backend at runtime without writing backend-specific dispatch code.
+
 Each implementation should be understandable and usable from other Rust applications without requiring a CLI or web server in the consuming application. `focal-fs` should remain dependency-light and should not require a daemon, database, or async runtime. `focal-sqlite` should use a caller-provided `rusqlite::Connection`.
 
 ## 2. Goals
@@ -23,6 +25,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - For `focal-fs`, keep each node's children in a dedicated child subfolder.
 - For `focal-fs`, use symlinks when a node has more than one parent.
 - For `focal-sqlite`, store nodes, content, and edges in SQLite while preserving the same graph behavior as `focal-fs`.
+- Provide a `focal-core` crate whose free-function API dispatches to `focal-fs` and, when the `sqlite` feature is enabled, `focal-sqlite` through a concrete `Backend` enum.
 - Support statement nodes and question-answer nodes.
 - Support graph navigation from any node.
 - Support listing ancestors and descendants.
@@ -35,6 +38,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - No database backend for `focal-fs`.
 - No network service for `focal-fs`.
 - No required CLI.
+- No additional storage engine inside `focal-core`; it is only a dispatch facade over storage crates.
 - No rich Markdown rendering.
 - No collaborative multi-writer synchronization.
 - No automatic semantic analysis of ideas.
@@ -44,6 +48,7 @@ Each implementation should be understandable and usable from other Rust applicat
 ## 4. Terminology
 
 - **Storage backend**: The persistence mechanism used by a crate. `focal-fs` uses the filesystem; `focal-sqlite` uses SQLite through `rusqlite`.
+- **Unified backend**: The `focal-core::Backend` enum value used by callers that want the same API over either `focal-fs` or `focal-sqlite`.
 - **Graph root**: For `focal-fs`, the root directory containing the whole idea graph.
 - **SQLite graph**: For `focal-sqlite`, a named graph namespace stored in tables inside a shared SQLite database and opened through a borrowed `rusqlite::Connection`.
 - **Node**: One idea entry. A node is either a statement or a question-answer pair.
@@ -479,6 +484,164 @@ The `focal-sqlite` graph handle mutably borrows the caller-provided connection a
 
 `open_database` is a convenience helper for callers that want the crate to create a `rusqlite::Connection` from a database path. Callers may also construct and configure their own `rusqlite::Connection` and pass it to `init_graph` or `open_graph`.
 
+`focal-core` exposes a unified API over both storage crates. It should depend on `focal-types` and `focal-fs` by default. SQLite support is enabled by a Cargo feature named `sqlite`; when that feature is enabled, `focal-core` also depends on `focal-sqlite` and `rusqlite`. The backend crates must not depend on `focal-core`.
+
+The unified API must be plain Rust free functions over a concrete backend enum, not a trait hierarchy, trait object, macro-generated API, async runtime, CLI wrapper, or service layer. It should re-export the shared `focal-types` public data types so callers can use the core crate as their primary dependency.
+
+```rust
+use std::path::Path;
+
+#[cfg(feature = "sqlite")]
+use rusqlite::Connection;
+
+pub enum Backend<'conn> {
+    Fs(focal_fs::IdeaGraph),
+    #[cfg(feature = "sqlite")]
+    Sqlite(focal_sqlite::IdeaGraph<'conn>),
+    #[cfg(not(feature = "sqlite"))]
+    Sqlite(EmptySqlite<'conn>),
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub struct EmptySqlite<'conn> {
+    graph_name: String,
+    _lifetime: std::marker::PhantomData<&'conn mut ()>,
+}
+
+pub enum Error {
+    Fs(focal_fs::Error),
+    #[cfg(feature = "sqlite")]
+    Sqlite(focal_sqlite::Error),
+    #[cfg(not(feature = "sqlite"))]
+    Sqlite(DisabledSqliteError),
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub struct DisabledSqliteError {
+    pub graph_name: String,
+}
+
+pub fn init_fs(
+    root: impl AsRef<Path>,
+) -> Result<Backend<'static>, Error>;
+
+pub fn open_fs(
+    root: impl AsRef<Path>,
+) -> Result<Backend<'static>, Error>;
+
+#[cfg(feature = "sqlite")]
+pub fn open_database(
+    path: impl AsRef<Path>,
+) -> Result<Connection, Error>;
+
+#[cfg(feature = "sqlite")]
+pub fn init_sqlite<'conn>(
+    connection: &'conn mut Connection,
+    graph_name: &str,
+) -> Result<Backend<'conn>, Error>;
+
+#[cfg(feature = "sqlite")]
+pub fn open_sqlite<'conn>(
+    connection: &'conn mut Connection,
+    graph_name: &str,
+) -> Result<Backend<'conn>, Error>;
+
+#[cfg(not(feature = "sqlite"))]
+pub fn disabled_sqlite(
+    graph_name: impl Into<String>,
+) -> Backend<'static>;
+
+pub fn add_root_node(
+    backend: &mut Backend<'_>,
+    node: NewNode,
+) -> Result<NodeId, Error>;
+
+pub fn add_child_node(
+    backend: &mut Backend<'_>,
+    parent_id: &str,
+    node: NewNode,
+) -> Result<NodeId, Error>;
+
+pub fn read_node(
+    backend: &Backend<'_>,
+    node_id: &str,
+) -> Result<Node, Error>;
+
+pub fn update_node(
+    backend: &mut Backend<'_>,
+    node_id: &str,
+    patch: NodePatch,
+) -> Result<Node, Error>;
+
+pub fn delete_node(
+    backend: &mut Backend<'_>,
+    node_id: &str,
+    mode: DeleteMode,
+) -> Result<(), Error>;
+
+pub fn link_existing_node(
+    backend: &mut Backend<'_>,
+    parent_id: &str,
+    child_id: &str,
+) -> Result<(), Error>;
+
+pub fn unlink_child(
+    backend: &mut Backend<'_>,
+    parent_id: &str,
+    child_id: &str,
+    orphan_policy: OrphanPolicy,
+) -> Result<(), Error>;
+
+pub fn list_roots(
+    backend: &Backend<'_>,
+) -> Result<Vec<NodeSummary>, Error>;
+
+pub fn list_children(
+    backend: &Backend<'_>,
+    node_id: &str,
+) -> Result<Vec<NodeSummary>, Error>;
+
+pub fn list_parents(
+    backend: &Backend<'_>,
+    node_id: &str,
+) -> Result<Vec<NodeSummary>, Error>;
+
+pub fn list_ancestors(
+    backend: &Backend<'_>,
+    node_id: &str,
+    options: TraversalOptions,
+) -> Result<Vec<NodeSummary>, Error>;
+
+pub fn list_descendants(
+    backend: &Backend<'_>,
+    node_id: &str,
+    options: TraversalOptions,
+) -> Result<Vec<NodeSummary>, Error>;
+
+pub fn rebuild_index(
+    backend: &Backend<'_>,
+) -> Result<GraphIndex, Error>;
+```
+
+The `Fs` variant does not borrow a connection. The filesystem constructor return type may use `Backend<'static>` or an equivalent lifetime design that lets filesystem backends be passed to every core operation accepting `Backend<'_>`.
+
+The `Sqlite` variant must remain present whether or not the `sqlite` feature is enabled. With the feature enabled, it wraps `focal_sqlite::IdeaGraph<'conn>`. With the feature disabled, it wraps an empty SQLite placeholder type such as `EmptySqlite<'conn>`, which must not depend on `focal-sqlite` or `rusqlite`.
+
+When the `sqlite` feature is disabled, every graph operation called with `Backend::Sqlite(EmptySqlite { .. })` must return `Err(focal_core::Error::Sqlite(DisabledSqliteError { .. }))` or an equivalent disabled-SQLite error payload. The SQLite connection-based constructor functions must only be available when the `sqlite` feature is enabled because their signatures require `rusqlite::Connection`.
+
+Core functions must dispatch exhaustively with `match backend` and forward to the corresponding backend crate operation. Mutating core operations take `&mut Backend<'_>` so the same call shape works for `focal-sqlite`; `focal-fs` may still implement its native mutating operations with shared references internally.
+
+The `focal-core` implementation must follow functional Rust error handling:
+
+- All public core graph operations return `Result<T, focal_core::Error>`.
+- Backend crates should expose public error types as `focal_fs::Error` and `focal_sqlite::Error`. These backend error types may differ.
+- `focal_core::Error` must preserve backend failures as typed variants: `Fs(focal_fs::Error)` for filesystem failures and, when the `sqlite` feature is enabled, `Sqlite(focal_sqlite::Error)` for SQLite failures.
+- `focal_core::Error` should implement `From<focal_fs::Error>` and, when the `sqlite` feature is enabled, `From<focal_sqlite::Error>`.
+- Missing nodes, parents, children, placements, canonical paths, or alias paths must be converted to the appropriate backend error and then into `focal_core::Error`.
+- Internal `Option` values must be handled with `match`, `if let`, `let else`, or `ok_or_else`; public core code must not use `unwrap`, `expect`, unchecked indexing, `panic!`, `todo!`, or `unimplemented!` for recoverable states.
+- Backend errors must be propagated with `?` or converted explicitly without discarding path, node ID, or storage context.
+- The core crate must not silently ignore errors from either backend to keep the shared API behavior identical across `focal-fs` and `focal-sqlite`.
+
 ## 11. Delete and Unlink Modes
 
 ```rust
@@ -737,7 +900,7 @@ For `focal-sqlite`, `rebuild_index` must query SQLite and return the same `Graph
 
 ## 20. Error Handling
 
-All public functions return `Result<T, GraphError>`.
+Storage backend public functions return `Result<T, GraphError>` or a crate-local error type with the same required error semantics. Backend crates that expose crate-local errors should name them `focal_fs::Error` and `focal_sqlite::Error` so `focal-core` can preserve them as typed variants.
 
 ```rust
 #[derive(Debug)]
@@ -770,6 +933,8 @@ The implementation should provide `Display` and `std::error::Error` implementati
 `GraphError::Io` should preserve the original `std::io::Error`.
 
 `GraphError::Storage` should be used for backend errors that are not naturally `std::io::Error`, including SQLite, `rusqlite`, or SQL execution failures.
+
+`focal-core` is the exception to the backend error return type. It owns `focal_core::Error` and its public graph operations return `Result<T, focal_core::Error>`.
 
 ## 21. Atomicity and Consistency
 
@@ -949,6 +1114,44 @@ Safety:
 - For `focal-fs`, never delete outside graph root.
 - For `focal-sqlite`, use parameterized SQL for caller-supplied values.
 
+Unified core API:
+
+- Construct a `focal_core::Backend::Fs` value from a filesystem graph and run the shared behavior tests through the `focal-core` free functions.
+- With the `sqlite` feature enabled, construct a `focal_core::Backend::Sqlite` value from a SQLite graph and run the shared behavior tests through the same `focal-core` free functions.
+- With the `sqlite` feature disabled, construct a `focal_core::Backend::Sqlite` value with the empty SQLite placeholder type and verify every graph operation returns the disabled-SQLite core error.
+- Verify mutating core functions dispatch correctly for both backend variants.
+- Verify read-only core functions dispatch correctly for both backend variants.
+- Verify backend-specific errors are propagated as typed `focal_core::Error` variants without being swallowed or collapsed into strings.
+- Verify missing nodes, parents, children, and placements are returned as errors, not panics or public `Option` values.
+- Verify public `focal-core` code paths do not use `unwrap`, `expect`, `panic!`, `todo!`, or `unimplemented!` for recoverable backend states.
+
+## `focal-core` Unified API Crate
+
+The workspace should include a `focal-core` crate, with Rust library name `focal_core`, that provides the unified free-function API described in Section 10.
+
+`focal-core` owns no storage format and defines no independent graph semantics. It is a dispatch facade over `focal-fs` and, when the `sqlite` feature is enabled, `focal-sqlite`. It uses the shared `focal-types` data model and owns the `focal_core::Error` type used by the unified API.
+
+The crate should:
+
+- Re-export the shared `focal-types` public types.
+- Define the concrete `Backend` enum over filesystem and SQLite graph handles.
+- Always include filesystem backend support.
+- Gate the `focal-sqlite` and `rusqlite` dependencies behind a Cargo feature named `sqlite`.
+- Keep a public `Backend::Sqlite` variant when the `sqlite` feature is disabled by using an empty SQLite placeholder payload.
+- Provide filesystem constructor functions unconditionally.
+- Provide SQLite connection-based constructor functions only when the `sqlite` feature is enabled.
+- Provide the shared graph operation functions that take `&Backend<'_>` or `&mut Backend<'_>`.
+- Dispatch each operation by matching the `Backend` variant and forwarding to the matching backend crate.
+- Preserve native backend errors as typed `focal_core::Error` variants.
+- Avoid exposing backend-specific branching to applications using the unified API.
+
+The crate must not:
+
+- Introduce a third storage implementation.
+- Require callers to use traits, trait objects, async tasks, a CLI, or a daemon.
+- Convert recoverable missing-value states into panics.
+- Return public `Option` values for graph operations that can report absence with `focal_core::Error`.
+
 ## `focal-sqlite` SQLite Backend
 
 The workspace should include a `focal-sqlite` crate, with Rust library name `focal_sqlite`, that implements the same idea graph behavior as `focal-fs` while using SQLite through `rusqlite` as the source of truth.
@@ -1092,6 +1295,13 @@ The shared graph behavior is acceptable when:
 - For `focal-fs`, shared children are represented with symlink entries.
 - For `focal-sqlite`, nodes and placements are stored in SQLite instead of the filesystem.
 - For `focal-sqlite`, shared children are represented with alias placement rows.
+- `focal-core` exposes a concrete `Backend` enum with filesystem and SQLite variants.
+- `focal-core` always includes filesystem support and gates SQLite support behind a `sqlite` Cargo feature.
+- `focal-core` keeps `Backend::Sqlite` present when the `sqlite` feature is disabled by using an empty SQLite placeholder that returns disabled-SQLite errors for graph operations.
+- `focal-core` exposes the shared graph operations as plain free functions that take `Backend`.
+- Applications can add, read, edit, link, unlink, delete, list, traverse, and validate through `focal-core` without backend-specific dispatch code.
+- `focal-core` handles missing values and backend failures with `Result<T, focal_core::Error>` instead of panics or public `Option` return values.
+- `focal_core::Error` preserves backend failures as typed variants for `focal_fs::Error` and, when enabled, `focal_sqlite::Error`.
 - Canonical node promotion works when deleting or unlinking canonical parents with remaining aliases.
 - The library can list roots, children, parents, ancestors, and descendants.
 - Traversal is deterministic, breadth-first, and deduplicated.
