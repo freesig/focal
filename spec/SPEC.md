@@ -1,52 +1,66 @@
-# Idea Graph Rust Library Specification
+# Focal Idea Graph Rust Library Specification
 
 ## 1. Purpose
 
-Build a small Rust library for storing and navigating an idea graph on disk.
+Build small Rust libraries for storing and navigating an idea graph.
 
-The graph is represented as plain folders, Markdown files, and symbolic links. The library provides simple Rust functions for reading, adding, editing, linking, unlinking, deleting, and traversing nodes.
+The shared behavior is exposed through simple Rust functions for reading, adding, editing, linking, unlinking, deleting, and traversing nodes.
 
-The implementation should be understandable, dependency-light, and usable from other Rust applications without requiring a daemon, database, async runtime, CLI, or web server.
+Two storage crates are specified:
+
+- `focal-fs`: stores the graph as plain folders, Markdown files, and symbolic links.
+- `focal-sqlite`: stores the same graph model in rqlite instead of the filesystem.
+
+Each implementation should be understandable and usable from other Rust applications without requiring a CLI or web server in the consuming application. `focal-fs` should remain dependency-light and should not require a daemon, database, or async runtime. `focal-sqlite` may require a caller-provided rqlite endpoint.
 
 ## 2. Goals
 
-- Store every idea node as human-readable Markdown.
-- Represent parent-child structure using the filesystem.
-- Keep each node in its own folder.
-- Keep each node's children in a dedicated child subfolder.
-- Use symlinks when a node has more than one parent.
+- Store every idea node as Markdown content.
+- Represent parent-child structure in the backend's native storage.
+- For `focal-fs`, keep each node in its own folder.
+- For `focal-fs`, keep each node's children in a dedicated child subfolder.
+- For `focal-fs`, use symlinks when a node has more than one parent.
+- For `focal-sqlite`, store nodes, content, and edges in rqlite while preserving the same graph behavior as `focal-fs`.
 - Support statement nodes and question-answer nodes.
 - Support graph navigation from any node.
 - Support listing ancestors and descendants.
-- Preserve stable node identity when folders or titles change.
-- Keep the graph usable by humans editing files manually, while making library-created changes consistent.
+- Preserve stable node identity when titles or backend-specific storage locations change.
+- Keep `focal-fs` graphs usable by humans editing files manually, while making library-created changes consistent.
+- Keep `focal-sqlite` graph operations deterministic and compatible with the same public behavior tests as `focal-fs`.
 
 ## 3. Non-Goals
 
-- No database backend.
-- No network service.
+- No database backend for `focal-fs`.
+- No network service for `focal-fs`.
 - No required CLI.
 - No rich Markdown rendering.
 - No collaborative multi-writer synchronization.
 - No automatic semantic analysis of ideas.
 - No support for arbitrary graph cycles in the first version.
+- No requirement for `focal-sqlite` to support manual filesystem edits, symlink repair, or arbitrary SQL access by callers.
 
 ## 4. Terminology
 
-- **Graph root**: The root directory containing the whole idea graph.
+- **Storage backend**: The persistence mechanism used by a crate. `focal-fs` uses the filesystem; `focal-sqlite` uses rqlite.
+- **Graph root**: For `focal-fs`, the root directory containing the whole idea graph.
+- **Rqlite graph**: For `focal-sqlite`, a graph stored in rqlite tables and opened through a rqlite connection configuration.
 - **Node**: One idea entry. A node is either a statement or a question-answer pair.
-- **Node directory**: The directory that contains one node's `node.md` file and `children/` directory.
-- **Canonical node directory**: The real directory that owns the node's Markdown and children.
-- **Alias node directory**: A symlink to a canonical node directory.
+- **Node directory**: For `focal-fs`, the directory that contains one node's `node.md` file and `children/` directory.
+- **Canonical node directory**: For `focal-fs`, the real directory that owns the node's Markdown and children.
+- **Alias node directory**: For `focal-fs`, a symlink to a canonical node directory.
+- **Canonical placement**: The authoritative backend location for a node. In `focal-fs`, this is a canonical node directory. In `focal-sqlite`, this is a persisted placement row.
+- **Alias placement**: An additional parent placement for a node. In `focal-fs`, this is an alias node directory. In `focal-sqlite`, this is a persisted non-canonical placement row.
 - **Parent edge**: A relationship from one node to one child node.
 - **Child edge**: The same relationship viewed from the parent node.
 - **Root node**: A node with no parent.
 - **Ancestor**: A parent, parent's parent, and so on.
 - **Descendant**: A child, child's child, and so on.
-- **Slug**: A filesystem-safe title fragment used in directory names.
-- **Node ID**: Stable, filesystem-safe identifier for a node. The ID must not change when the title, Markdown, or folder slug changes.
+- **Slug**: A backend-safe title fragment used in filesystem directory names or logical rqlite paths.
+- **Node ID**: Stable, backend-safe identifier for a node. The ID must not change when the title, Markdown, folder slug, or logical path changes.
 
-## 5. Filesystem Layout
+## 5. `focal-fs` Filesystem Layout
+
+This section applies to the `focal-fs` crate.
 
 The graph root uses this layout:
 
@@ -86,7 +100,7 @@ Every symlink node entry must point to a canonical node directory, not directly 
 
 The library must create relative symlinks where possible so a graph can be moved as a folder without breaking links.
 
-## 6. Node Directory Naming
+## 6. `focal-fs` Node Directory Naming
 
 Node directories use:
 
@@ -115,7 +129,7 @@ Node IDs must be:
 
 - Stable for the lifetime of a node.
 - Unique within a graph.
-- Safe for use in directory names.
+- Safe for use in directory names and logical paths.
 - Independent of title and content.
 
 Required format:
@@ -142,7 +156,7 @@ The library must reject IDs that are not valid UUID strings. It must also reject
 
 ## 8. Markdown Format
 
-Each node is stored in `node.md`.
+Each node has a Markdown representation. For `focal-fs`, each node is stored in `node.md`. For `focal-sqlite`, the same fields and content are stored in rqlite rows, and any Markdown import or export should use this format.
 
 The file starts with a simple line-oriented metadata block. The metadata block looks like YAML front matter, but the parser only needs to support flat `key: value` lines.
 
@@ -266,9 +280,13 @@ pub struct NodeSummary {
 
 The implementation may add private fields, but public types should stay small and easy to construct in tests.
 
+For `focal-fs`, `canonical_path`, `alias_paths`, and `GraphEdge.path` are filesystem paths. For `focal-sqlite`, those fields are logical graph paths built from the same slug and node ID format, such as `roots/parent--<id>/children/child--<id>`. They identify the same canonical and alias placements but must not imply that files or directories exist on disk.
+
 ## 10. Public API
 
-The library should provide an opaque graph handle and simple functions.
+Each crate should provide an opaque graph handle and simple functions with equivalent behavior.
+
+`focal-fs` opens graphs from a filesystem root:
 
 ```rust
 use std::path::Path;
@@ -353,7 +371,9 @@ pub fn rebuild_index(
 ) -> Result<GraphIndex, GraphError>;
 ```
 
-`rebuild_index` may be public even if the first implementation does not persist an index. It gives callers a way to validate and inspect the graph.
+`rebuild_index` may be public even if a backend does not persist a separate index. It gives callers a way to validate and inspect the graph.
+
+`focal-sqlite` should expose the same operation names and return types after graph initialization. Its initialization functions may accept a rqlite URL or connection configuration instead of a filesystem path.
 
 ## 11. Delete and Unlink Modes
 
@@ -386,7 +406,7 @@ If a descendant also has another parent outside the deleted subtree, only remove
 
 ### `MoveToRoots`
 
-When unlinking a child would leave it with no parents, move the child's canonical directory under `roots/`.
+When unlinking a child would leave it with no parents, move the child's canonical placement under roots.
 
 ### `DeleteIfNoParents`
 
@@ -397,6 +417,8 @@ When unlinking a child would leave it with no parents, delete the child accordin
 When unlinking a child would leave it with no parents, abort with `GraphError::WouldOrphanNode`.
 
 ## 12. Symlink Semantics
+
+This section applies to the `focal-fs` crate. `focal-sqlite` must provide equivalent shared-parent behavior with persisted placement rows instead of symlinks.
 
 A node with one parent may be represented as a real directory under that parent's `children/`.
 
@@ -468,8 +490,8 @@ Traversal requirements:
 - Traversal starts from the start node's neighbors, not the start node itself.
 - `list_ancestors` walks parent edges upward.
 - `list_descendants` walks child edges downward.
-- Traversal through symlinks must behave the same as traversal through real directories.
-- If malformed manual edits create a missing target, traversal should return `GraphError::BrokenSymlink` unless the caller later gets an option to ignore broken links.
+- For `focal-fs`, traversal through symlinks must behave the same as traversal through real directories.
+- For `focal-fs`, if malformed manual edits create a missing target, traversal should return `GraphError::BrokenSymlink` unless the caller later gets an option to ignore broken links.
 
 ## 15. Editing Semantics
 
@@ -485,11 +507,11 @@ When title changes:
 
 - Rewrite the title metadata field.
 - Do not rewrite a top-level `# Heading`.
-- Do not rename the canonical node directory.
-- Do not rename alias symlinks.
+- Do not rename the canonical placement.
+- Do not rename alias placements.
 - Keep the node ID unchanged.
 - Keep parent and child relationships unchanged.
-- The directory slug may become stale after a title edit.
+- The directory slug or logical path slug may become stale after a title edit.
 
 Markdown rewrite rules:
 
@@ -502,17 +524,17 @@ Markdown rewrite rules:
 
 Adding a root node:
 
-- Creates a canonical node directory under `<graph-root>/roots/`.
-- Writes `node.md`.
-- Creates `children/`.
+- Creates a canonical placement under roots.
+- Stores node metadata and Markdown content.
+- For `focal-fs`, creates a canonical node directory under `<graph-root>/roots/`, writes `node.md`, and creates `children/`.
 - Returns the generated node ID.
 
 Adding a child node:
 
-- Finds the parent's canonical directory.
-- Creates a canonical node directory under `<parent-dir>/children/`.
-- Writes `node.md`.
-- Creates `children/`.
+- Finds the parent's canonical placement.
+- Creates a canonical placement under the parent.
+- Stores node metadata and Markdown content.
+- For `focal-fs`, creates a canonical node directory under `<parent-dir>/children/`, writes `node.md`, and creates `children/`.
 - Returns the generated node ID.
 
 Input validation:
@@ -530,14 +552,15 @@ Input validation:
 - Locate a node by ID anywhere in the graph.
 - Parse metadata.
 - Parse content according to `kind`.
-- Return canonical path and alias paths.
-- Return an error if multiple real canonical directories claim the same ID.
-- Return an error if the node is found only as a broken symlink.
+- Return canonical path and alias paths. For `focal-sqlite`, these are logical graph paths.
+- For `focal-fs`, return an error if multiple real canonical directories claim the same ID.
+- For `focal-fs`, return an error if the node is found only as a broken symlink.
 
 `list_roots` must:
 
-- Return all nodes under `<graph-root>/roots/`.
-- Include canonical root directories.
+- Return all root nodes.
+- For `focal-fs`, return all nodes under `<graph-root>/roots/`.
+- Include canonical root placements.
 - Include promoted roots.
 - Exclude broken symlinks unless returning a validation error.
 
@@ -548,24 +571,24 @@ The first version does not expose general node move behavior.
 Automatic movement is limited to:
 
 - Promotion when deleting or unlinking a canonical parent while alias parents remain.
-- Moving an orphaned canonical node to `roots/` when `OrphanPolicy::MoveToRoots` is explicitly requested.
+- Moving an orphaned canonical node to roots when `OrphanPolicy::MoveToRoots` is explicitly requested.
 
 Promotion requirements:
 
-- If a canonical node directory is removed from one parent while alias parents remain, choose the lexicographically first alias path as the new canonical location.
-- Replace that alias symlink with the real canonical directory.
-- Rewrite other aliases to point to the new canonical directory.
-- Preserve the promoted node's `node.md` and full child subtree.
+- If a canonical placement is removed from one parent while alias placements remain, choose the lexicographically first alias path as the new canonical location.
+- Replace that alias placement with the canonical placement.
+- Rewrite other aliases to point to the new canonical placement when the backend stores explicit alias targets.
+- Preserve the promoted node's Markdown content and full child subtree.
 - Keep the promoted node ID unchanged.
 - Keep child node IDs unchanged.
 - Keep Markdown unchanged except for `updated_at_unix` if the operation intentionally records structural edits.
-- Title edits must not trigger directory moves in the first version.
+- Title edits must not trigger directory or logical placement moves in the first version.
 
 ## 19. Indexing and Discovery
 
-The library must discover nodes by scanning the filesystem on demand.
+`focal-fs` must discover nodes by scanning the filesystem on demand.
 
-The first version must not require an in-memory index or a persistent index for normal operation.
+The first `focal-fs` version must not require an in-memory index or a persistent index for normal operation. `focal-sqlite` may use rqlite tables and indexes as its source of truth.
 
 `GraphIndex` is a transient validation and inspection result returned by `rebuild_index`.
 
@@ -596,7 +619,7 @@ pub enum GraphProblem {
 }
 ```
 
-Scan rules:
+`focal-fs` scan rules:
 
 - Scan `roots/` recursively.
 - Record real directories as canonical candidates.
@@ -604,6 +627,8 @@ Scan rules:
 - Do not recursively descend into symlink entries after recording the edge.
 - Deduplicate by node ID.
 - Validate that every real node directory has `node.md` and `children/`.
+
+For `focal-sqlite`, `rebuild_index` must query rqlite and return the same `GraphIndex` shape. `GraphEdge.path` must be a logical graph path, and `GraphEdge.is_symlink` must be `true` for alias placements and `false` for canonical placements.
 
 ## 20. Error Handling
 
@@ -613,6 +638,7 @@ All public functions return `Result<T, GraphError>`.
 #[derive(Debug)]
 pub enum GraphError {
     Io(std::io::Error),
+    Storage(String),
     InvalidGraphRoot(String),
     NodeNotFound(String),
     ParentNotFound(String),
@@ -638,23 +664,27 @@ The implementation should provide `Display` and `std::error::Error` implementati
 
 `GraphError::Io` should preserve the original `std::io::Error`.
 
+`GraphError::Storage` should be used for backend errors that are not naturally `std::io::Error`, including rqlite request, response, consensus, or SQL execution failures.
+
 ## 21. Atomicity and Consistency
 
-The first version uses best-effort filesystem operations.
+`focal-fs` uses best-effort filesystem operations.
 
 Requirements:
 
 - Create directories before writing `node.md`.
 - Create symlinks only after the target node exists.
 - Do not require rollback for multi-step directory or symlink operations.
-- Do not require transactional guarantees.
+- Do not require transactional guarantees for `focal-fs`.
 - After an operation fails, callers should use `rebuild_index` to validate and repair the graph.
 - Error values should include enough path information to help manual repair where possible.
 - The implementation may use atomic file writes for Markdown, but atomic file writes are not required by this version of the spec.
 
+`focal-sqlite` should execute each multi-row mutation as a single rqlite transaction where supported by rqlite. After a failed operation, callers should still be able to use `rebuild_index` to inspect persisted state.
+
 ## 22. Concurrency
 
-The first version only needs to support one writer process at a time.
+The first `focal-fs` version only needs to support one writer process at a time.
 
 Requirements:
 
@@ -664,7 +694,11 @@ Requirements:
 - If a simple lock is implemented, use an exclusive lock file created with `create_new(true)` under `.idea-graph/write.lock`.
 - Stale lock handling can be deferred.
 
+`focal-sqlite` may rely on rqlite for write serialization and consistency. The crate should document any additional client-side concurrency limitations.
+
 ## 23. Platform Requirements
+
+These platform requirements apply to `focal-fs`.
 
 Supported targets:
 
@@ -682,11 +716,13 @@ Windows support:
 
 The code should isolate platform-specific symlink creation behind a small internal function.
 
+`focal-sqlite` should support any platform where the crate's Rust client dependencies can connect to a supported rqlite server.
+
 ## 24. Validation
 
 The library should expose a validation path through `rebuild_index`.
 
-Validation should detect:
+`focal-fs` validation should detect:
 
 - Missing `roots/`.
 - Node directories without `node.md`.
@@ -697,11 +733,13 @@ Validation should detect:
 - Cycles.
 - Edges pointing outside the graph root.
 
-By default, symlink targets outside the graph root must be rejected.
+For `focal-fs`, symlink targets outside the graph root must be rejected by default.
+
+`focal-sqlite` validation should detect duplicate node IDs, invalid node content, missing edge endpoints, duplicate parent-child placements, multiple canonical placements for one node, cycles, and any stored logical path that does not match the node ID it claims to represent.
 
 ## 25. Security and Safety
 
-The library must treat the graph root as a boundary.
+`focal-fs` must treat the graph root as a boundary.
 
 Requirements:
 
@@ -712,15 +750,19 @@ Requirements:
 - Validate that a delete target is inside the graph root.
 - Avoid shelling out to system commands.
 
+`focal-sqlite` must treat the configured rqlite database namespace as the graph boundary. It must use parameterized SQL or equivalent request encoding for caller-supplied values and must not shell out to system commands.
+
 ## 26. Testing Requirements
 
-The implementation should include tests for the following behavior.
+Each backend implementation should include tests for the shared behavior below. Filesystem-specific assertions apply to `focal-fs`; rqlite-specific assertions apply to `focal-sqlite`.
 
 Initialization:
 
-- `init_graph` creates `roots/`.
-- `init_graph` does not require `.idea-graph/VERSION`.
-- `open_graph` fails for a non-graph directory.
+- `init_graph` creates backend storage.
+- For `focal-fs`, `init_graph` creates `roots/`.
+- For `focal-fs`, `init_graph` does not require `.idea-graph/VERSION`.
+- For `focal-fs`, `open_graph` fails for a non-graph directory.
+- For `focal-sqlite`, `open_graph` fails when required graph tables or metadata are missing.
 
 Adding:
 
@@ -736,7 +778,8 @@ Reading:
 
 - Read a statement node from its ID.
 - Read a question-answer node from its ID.
-- Read a node through a symlink parent and get the canonical content.
+- For `focal-fs`, read a node through a symlink parent and get the canonical content.
+- For `focal-sqlite`, read a node through an alias placement and get the canonical content.
 
 Editing:
 
@@ -745,23 +788,25 @@ Editing:
 - Update answer text.
 - Update title and verify metadata updates.
 - Verify title edits do not require a top-level `# Heading`.
-- Verify title edits do not rename the node directory.
+- Verify title edits do not rename the node directory or logical path.
 - Verify node ID remains stable across edits.
 
 Linking:
 
 - Link an existing child under a second parent.
-- Verify a symlink is created.
+- For `focal-fs`, verify a symlink is created.
+- For `focal-sqlite`, verify an alias placement row is created.
 - Verify `list_parents` returns both parents.
 - Verify duplicate link is idempotent.
 - Reject a link that would create a cycle.
 
 Unlinking:
 
-- Remove a symlink parent and keep the canonical node.
+- Remove an alias parent and keep the canonical node.
 - Remove a canonical parent while an alias parent remains and verify promotion.
-- Verify promoted nodes preserve `node.md` and the full child subtree.
-- Verify promotion rewrites remaining alias symlinks.
+- Verify promoted nodes preserve Markdown content and the full child subtree.
+- For `focal-fs`, verify promotion rewrites remaining alias symlinks.
+- For `focal-sqlite`, verify promotion rewrites canonical and alias placement rows.
 - Verify promotion with multiple aliases chooses the lexicographically first alias path.
 - Move an orphaned node to roots when requested.
 - Fail when unlinking would orphan a node and `FailIfWouldOrphan` is used.
@@ -787,19 +832,67 @@ Traversal:
 Validation:
 
 - Detect duplicate IDs.
-- Detect broken symlinks.
-- Detect missing `children/`.
-- Detect malformed `node.md`.
+- For `focal-fs`, detect broken symlinks.
+- For `focal-fs`, detect missing `children/`.
+- For `focal-fs`, detect malformed `node.md`.
+- For `focal-sqlite`, detect missing edge endpoints, duplicate placements, and invalid stored node content.
 - Detect manual cycle and avoid infinite traversal.
 
 Safety:
 
-- Reject symlink targets outside graph root.
-- Never delete outside graph root.
+- For `focal-fs`, reject symlink targets outside graph root.
+- For `focal-fs`, never delete outside graph root.
+- For `focal-sqlite`, use parameterized SQL or equivalent request encoding for caller-supplied values.
+
+## `focal-sqlite` Rqlite Backend
+
+The workspace should include a `focal-sqlite` crate, with Rust library name `focal_sqlite`, that implements the same idea graph behavior as `focal-fs` while using rqlite as the source of truth.
+
+`focal-sqlite` must not create or depend on `roots/`, `node.md`, `children/`, or symlink entries for normal operation. Filesystem paths exposed by shared public types are logical graph paths only.
+
+Initialization:
+
+- `init_graph` should create or migrate the required rqlite schema for one graph namespace.
+- `open_graph` should validate that the required schema exists before returning an `IdeaGraph`.
+- Initialization may accept a rqlite URL, client, or connection configuration instead of a filesystem path.
+- The crate should document whether it owns schema creation or expects a caller-managed rqlite database.
+
+Storage requirements:
+
+- Store nodes in rqlite with stable UUID node IDs, kind, title, Markdown content fields, `created_at_unix`, and `updated_at_unix`.
+- Store parent-child relationships in rqlite as placement rows.
+- A root node has a canonical placement with no parent.
+- A child node has exactly one canonical placement and zero or more alias placements.
+- Each `(parent_id, child_id)` edge must be unique.
+- Each node must have at most one canonical placement.
+- Logical paths should use the same slug and `--<node-id>` naming convention as `focal-fs` so ordering, summaries, and diagnostics stay comparable.
+
+Behavioral requirements:
+
+- Public operations after initialization must match `focal-fs` semantics unless this section explicitly says otherwise.
+- `add_root_node` and `add_child_node` insert node and placement rows instead of creating directories and Markdown files.
+- `read_node` returns node content from the canonical node row, with logical canonical and alias paths.
+- `link_existing_node` creates an alias placement row when the edge does not already exist.
+- `unlink_child` removes only the requested placement and applies the same orphan policies as `focal-fs`.
+- Promotion chooses the lexicographically first alias logical path and marks that placement canonical.
+- `delete_node` preserves shared descendants and removes only rows that are exclusively reachable through the deleted subtree.
+- Traversal order, cycle rejection, ancestor listing, descendant listing, and deduplication must match `focal-fs`.
+- `rebuild_index` returns the same `GraphIndex` shape using rqlite queries.
+
+Consistency requirements:
+
+- Mutations that insert, delete, or promote multiple rows should run as one rqlite transaction where supported.
+- The schema should use database constraints for node ID uniqueness, edge uniqueness, and canonical placement uniqueness where SQLite supports them.
+- The crate should be safe to use with multiple readers and should document the write consistency guarantees it relies on from rqlite.
+
+Testing requirements:
+
+- The shared public API behavior tests should run against `focal-sqlite` with rqlite-backed storage.
+- Tests should cover rqlite schema initialization, opening an existing rqlite graph, alias placement creation, promotion, recursive delete with shared descendants, traversal determinism, validation, and storage errors.
 
 ## Spec Test Traceability
 
-Each row points to at least one in-crate unit test and one public API integration test for the numbered section.
+Each row points to at least one `focal-fs` in-crate unit test and one public API integration test for the numbered section. When `focal-sqlite` is implemented, it must add equivalent traceability for the shared behavior and rqlite-specific backend requirements.
 
 | Section | Unit tests | Integration tests |
 |---|---|---|
@@ -874,22 +967,25 @@ assert_eq!(descendants[0].id, qa_id);
 
 ## 28. Acceptance Criteria
 
-The library is acceptable when:
+The shared graph behavior is acceptable when:
 
-- A graph can be initialized in an empty directory.
-- No `.idea-graph/VERSION` file is required.
+- A graph can be initialized in empty backend storage.
+- For `focal-fs`, a graph can be initialized in an empty directory.
+- For `focal-fs`, no `.idea-graph/VERSION` file is required.
 - Statement and question-answer nodes can be added, read, updated, and deleted.
 - Generated node IDs are UUID strings.
-- Every node is represented by a directory containing `node.md` and `children/`.
-- Root nodes live under `roots/`.
-- Child nodes live under a parent's `children/`.
-- Shared children are represented with symlink entries.
+- For `focal-fs`, every node is represented by a directory containing `node.md` and `children/`.
+- For `focal-fs`, root nodes live under `roots/`.
+- For `focal-fs`, child nodes live under a parent's `children/`.
+- For `focal-fs`, shared children are represented with symlink entries.
+- For `focal-sqlite`, nodes and placements are stored in rqlite instead of the filesystem.
+- For `focal-sqlite`, shared children are represented with alias placement rows.
 - Canonical node promotion works when deleting or unlinking canonical parents with remaining aliases.
 - The library can list roots, children, parents, ancestors, and descendants.
 - Traversal is deterministic, breadth-first, and deduplicated.
 - Link operations reject cycles.
 - Delete operations do not remove shared descendants unless explicitly targeted.
 - Markdown remains human-readable after library edits.
-- The graph can be validated for common manual-edit problems.
-- Destructive operations are constrained to the graph root.
-- The first version supports macOS and Linux only.
+- The graph can be validated for common backend consistency problems.
+- Destructive operations are constrained to the graph root for `focal-fs` and to the configured rqlite graph namespace for `focal-sqlite`.
+- The first `focal-fs` version supports macOS and Linux only.
