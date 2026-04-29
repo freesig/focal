@@ -1,4 +1,4 @@
 interface:
   display_name: "Spec Priority"
-  short_description: "Review rework-risk spec items"
-  default_prompt: "Use $spec-priority to identify the highest-priority review items in the attached spec excerpt, collect my decisions, and update the spec when I say done."
+  short_description: "Review one rework-risk spec item"
+  default_prompt: "Use $spec-priority to identify the single highest-priority review item in the attached spec excerpt, collect my decision, then continue one item at a time until I say done."
