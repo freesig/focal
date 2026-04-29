@@ -1,4 +1,4 @@
 interface:
   display_name: "Spec Priority"
-  short_description: "Prioritize spec items for review"
-  default_prompt: "Use $spec-priority to prioritize the attached spec excerpt for human review before implementation."
+  short_description: "Review rework-risk spec items"
+  default_prompt: "Use $spec-priority to identify the highest-priority review items in the attached spec excerpt, collect my decisions, and update the spec when I say done."
