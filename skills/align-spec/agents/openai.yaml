@@ -1,0 +1,4 @@
+interface:
+  display_name: "Align Spec"
+  short_description: "Find spec/code drift by rework risk"
+  default_prompt: "Use $align-spec to compare this spec with the codebase, surface the highest rework-risk divergence one item at a time, and apply my decisions when I say done."
