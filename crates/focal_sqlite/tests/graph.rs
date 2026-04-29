@@ -1,10 +1,11 @@
 use focal_sqlite::{
     DeleteMode, GraphError, GraphProblem, NewNode, NodeContent, NodeKind, NodePatch, OrphanPolicy,
     TraversalOptions, add_child_node, add_root_node, delete_node, init_graph, link_existing_node,
-    list_ancestors, list_children, list_descendants, list_parents, list_roots, open_graph,
-    read_node, rebuild_index, unlink_child, update_node,
+    list_ancestors, list_children, list_descendants, list_parents, list_roots, open_database,
+    open_graph, read_node, rebuild_index, unlink_child, update_node,
 };
 use rusqlite::{Connection, params};
+use tempfile::NamedTempFile;
 
 fn statement(title: &str, body: &str) -> NewNode {
     NewNode {
@@ -150,6 +151,73 @@ fn add_read_update_and_path_stability() {
 }
 
 #[test]
+fn root_question_answer_nodes_update_without_path_changes() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut graph = init_graph(&mut connection, "main").unwrap();
+    let root = add_root_node(&mut graph, qa("Original title", "What is stored?", "")).unwrap();
+
+    let before = read_node(&graph, &root).unwrap();
+    assert_eq!(
+        before.content,
+        NodeContent::QuestionAnswer {
+            question: "What is stored?".to_string(),
+            answer: String::new(),
+        }
+    );
+    assert_eq!(list_roots(&graph).unwrap()[0].id, root);
+
+    let updated = update_node(
+        &mut graph,
+        &root,
+        NodePatch {
+            title: Some("Updated title".to_string()),
+            content: Some(NodeContent::QuestionAnswer {
+                question: "What changed?".to_string(),
+                answer: "The row content changed.".to_string(),
+            }),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(updated.id, root);
+    assert_eq!(updated.kind, NodeKind::QuestionAnswer);
+    assert_eq!(updated.canonical_path, before.canonical_path);
+    assert_eq!(updated.alias_paths, before.alias_paths);
+    assert!(updated.updated_at_unix > before.updated_at_unix);
+    assert_eq!(
+        updated.content,
+        NodeContent::QuestionAnswer {
+            question: "What changed?".to_string(),
+            answer: "The row content changed.".to_string(),
+        }
+    );
+    assert_eq!(list_roots(&graph).unwrap()[0].title, "Updated title");
+}
+
+#[test]
+fn rejects_empty_titles_and_questions() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut graph = init_graph(&mut connection, "main").unwrap();
+
+    assert!(matches!(
+        add_root_node(&mut graph, statement(" \n\t ", "")),
+        Err(GraphError::InvalidTitle)
+    ));
+    assert!(matches!(
+        add_root_node(&mut graph, qa("Question", " \n\t ", "")),
+        Err(GraphError::InvalidMarkdown { reason, .. })
+            if reason == "question must not be empty"
+    ));
+
+    let parent = add_root_node(&mut graph, statement("Parent", "")).unwrap();
+    assert!(matches!(
+        add_child_node(&mut graph, &parent, qa("Child Question", "", "")),
+        Err(GraphError::InvalidMarkdown { reason, .. })
+            if reason == "question must not be empty"
+    ));
+}
+
+#[test]
 fn linking_is_idempotent_and_rejects_cycles() {
     let mut connection = Connection::open_in_memory().unwrap();
     let mut graph = init_graph(&mut connection, "main").unwrap();
@@ -202,6 +270,46 @@ fn root_linking_and_orphan_move_rewrite_logical_paths() {
 }
 
 #[test]
+fn unlinking_alias_parent_preserves_canonical_node() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut graph = init_graph(&mut connection, "main").unwrap();
+    let canonical_parent = add_root_node(&mut graph, statement("Canonical Parent", "")).unwrap();
+    let alias_parent = add_root_node(&mut graph, statement("Alias Parent", "")).unwrap();
+    let child =
+        add_child_node(&mut graph, &canonical_parent, statement("Child", "content")).unwrap();
+
+    link_existing_node(&mut graph, &alias_parent, &child).unwrap();
+    let before = read_node(&graph, &child).unwrap();
+    assert_eq!(before.alias_paths.len(), 1);
+
+    unlink_child(
+        &mut graph,
+        &alias_parent,
+        &child,
+        OrphanPolicy::FailIfWouldOrphan,
+    )
+    .unwrap();
+
+    let after = read_node(&graph, &child).unwrap();
+    assert_eq!(after.canonical_path, before.canonical_path);
+    assert_eq!(after.content, before.content);
+    assert!(after.alias_paths.is_empty());
+    assert_eq!(
+        list_children(&graph, &canonical_parent)
+            .unwrap()
+            .into_iter()
+            .map(|node| (node.id, node.is_alias))
+            .collect::<Vec<_>>(),
+        vec![(child.clone(), false)]
+    );
+    assert!(list_children(&graph, &alias_parent).unwrap().is_empty());
+    assert_eq!(
+        list_parents(&graph, &child).unwrap()[0].id,
+        canonical_parent
+    );
+}
+
+#[test]
 fn unlinking_canonical_parent_promotes_alias_and_preserves_subtree() {
     let mut connection = Connection::open_in_memory().unwrap();
     let mut graph = init_graph(&mut connection, "main").unwrap();
@@ -220,6 +328,41 @@ fn unlinking_canonical_parent_promotes_alias_and_preserves_subtree() {
     assert!(after.alias_paths.is_empty());
     assert_eq!(list_children(&graph, &new_parent).unwrap()[0].id, child);
     assert_eq!(list_children(&graph, &child).unwrap()[0].id, grandchild);
+}
+
+#[test]
+fn promotion_with_multiple_aliases_chooses_first_logical_path() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut graph = init_graph(&mut connection, "main").unwrap();
+    let old_parent = add_root_node(&mut graph, statement("Old Parent", "")).unwrap();
+    let alpha_parent = add_root_node(&mut graph, statement("Alpha Parent", "")).unwrap();
+    let beta_parent = add_root_node(&mut graph, statement("Beta Parent", "")).unwrap();
+    let child = add_child_node(&mut graph, &old_parent, statement("Child", "content")).unwrap();
+
+    link_existing_node(&mut graph, &beta_parent, &child).unwrap();
+    link_existing_node(&mut graph, &alpha_parent, &child).unwrap();
+    let before = read_node(&graph, &child).unwrap();
+    assert_eq!(before.alias_paths.len(), 2);
+    let expected_canonical = before.alias_paths[0].clone();
+    let remaining_alias = before.alias_paths[1].clone();
+
+    unlink_child(&mut graph, &old_parent, &child, OrphanPolicy::MoveToRoots).unwrap();
+
+    let after = read_node(&graph, &child).unwrap();
+    assert_eq!(after.canonical_path, expected_canonical);
+    assert_eq!(after.alias_paths, vec![remaining_alias]);
+    assert!(
+        list_children(&graph, &alpha_parent)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == child && !node.is_alias)
+    );
+    assert!(
+        list_children(&graph, &beta_parent)
+            .unwrap()
+            .iter()
+            .any(|node| node.id == child && node.is_alias)
+    );
 }
 
 #[test]
@@ -523,4 +666,26 @@ fn failed_multi_row_write_rolls_back_transaction() {
         .unwrap();
     let graph = open_graph(&mut connection, "main").unwrap();
     assert!(list_roots(&graph).unwrap().is_empty());
+}
+
+#[test]
+fn open_database_opens_path_and_preserves_named_graph() {
+    let file = NamedTempFile::new().unwrap();
+
+    {
+        let mut connection = open_database(file.path()).unwrap();
+        let mut graph = init_graph(&mut connection, "main").unwrap();
+        add_root_node(&mut graph, statement("Stored Root", "body")).unwrap();
+    }
+
+    let mut connection = open_database(file.path()).unwrap();
+    let graph = open_graph(&mut connection, "main").unwrap();
+    assert_eq!(
+        list_roots(&graph)
+            .unwrap()
+            .into_iter()
+            .map(|node| node.title)
+            .collect::<Vec<_>>(),
+        vec!["Stored Root"]
+    );
 }

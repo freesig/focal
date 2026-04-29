@@ -536,7 +536,8 @@ When `link_existing_node(parent_id, child_id)` is called:
 - If the edge already exists, return success without changing the filesystem.
 - If `parent_id == child_id`, return `GraphError::CycleDetected`.
 - If the link would make an ancestor a descendant of itself, return `GraphError::CycleDetected`.
-- Create a symlink in `<parent-dir>/children/`.
+- If the child is currently a root node with no other parents, move the child's canonical placement under the new parent.
+- Otherwise, create a symlink in `<parent-dir>/children/`.
 - The symlink must point to the child's canonical node directory.
 
 When reading through a symlink:
@@ -959,10 +960,11 @@ A single SQLite database may contain multiple named graph namespaces. Every grap
 Initialization:
 
 - `open_database(path)` should create a `rusqlite::Connection` from a database path for callers that want a convenience helper.
-- `init_graph(&mut Connection, graph_name)` should create or migrate the required shared SQLite schema if missing, then create the named graph namespace if missing.
+- `init_graph(&mut Connection, graph_name)` should create the required shared SQLite schema if missing, then create the named graph namespace if missing.
 - `open_graph(&mut Connection, graph_name)` should validate that the required shared schema and named graph namespace already exist before returning an `IdeaGraph`.
 - The `IdeaGraph` handle should borrow the caller-provided `rusqlite::Connection` and must not own or close it.
-- The crate owns schema creation and migration through `init_graph`; callers own the connection lifecycle and may configure the `rusqlite::Connection` themselves.
+- The crate owns v1 schema creation through `init_graph`; callers own the connection lifecycle and may configure the `rusqlite::Connection` themselves.
+- The first version does not migrate incompatible existing SQLite tables. If existing tables are partial or incompatible, `init_graph` may return a storage error and `open_graph` should reject the schema as invalid.
 
 Storage requirements:
 
@@ -982,7 +984,7 @@ Behavioral requirements:
 - Mutating operations should take `&mut IdeaGraph`; read, list, traversal, and validation operations should take `&IdeaGraph`.
 - `add_root_node` and `add_child_node` insert node and placement rows scoped to the selected graph namespace instead of creating directories and Markdown files.
 - `read_node` returns node content from the canonical node row, with logical canonical and alias paths.
-- `link_existing_node` creates an alias placement row when the edge does not already exist.
+- `link_existing_node` creates an alias placement row when the edge does not already exist, except when linking a root node with no other parents under a parent; in that case it moves the root's canonical placement under the new parent to match `focal-fs`.
 - `unlink_child` removes only the requested placement and applies the same orphan policies as `focal-fs`.
 - Promotion chooses the lexicographically first alias logical path and marks that placement canonical.
 - `delete_node` preserves shared descendants and removes only rows that are exclusively reachable through the deleted subtree.
