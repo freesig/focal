@@ -5,6 +5,7 @@
 //! callers remain responsible for opening, configuring, and closing it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,45 @@ pub use focal_types::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
+
+#[derive(Debug)]
+pub struct Error {
+    source: GraphError,
+}
+
+impl Error {
+    pub fn as_graph_error(&self) -> &GraphError {
+        &self.source
+    }
+
+    pub fn into_graph_error(self) -> GraphError {
+        self.source
+    }
+}
+
+impl From<GraphError> for Error {
+    fn from(source: GraphError) -> Self {
+        Self { source }
+    }
+}
+
+impl From<Error> for GraphError {
+    fn from(error: Error) -> Self {
+        error.source
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 const MAX_SLUG_BYTES: usize = 80;
 

@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/focal_fs", "crates/focal_sqlite", "crates/focal_types"]
+members = [
+    "crates/focal_core",
+    "crates/focal_fs",
+    "crates/focal_sqlite",
+    "crates/focal_types",
+]
 resolver = "2"
 
 [workspace.package]

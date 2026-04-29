@@ -1,0 +1,22 @@
+[package]
+name = "focal-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "focal_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+sqlite = ["dep:focal-sqlite", "dep:rusqlite"]
+
+[dependencies]
+focal-fs = { path = "../focal_fs" }
+focal-sqlite = { path = "../focal_sqlite", optional = true }
+focal-types = { path = "../focal_types" }
+rusqlite = { version = "0.32", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

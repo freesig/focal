@@ -11,7 +11,7 @@ mod model;
 mod ops;
 mod scan;
 
-pub use error::GraphError;
+pub use error::{Error, GraphError};
 pub use model::{
     DeleteMode, GraphEdge, GraphIndex, GraphProblem, IdeaGraph, NewNode, Node, NodeContent, NodeId,
     NodeKind, NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
