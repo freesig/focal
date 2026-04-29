@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/focal_fs"]
+members = ["crates/focal_fs", "crates/focal_sqlite", "crates/focal_types"]
 resolver = "2"
 
 [workspace.package]

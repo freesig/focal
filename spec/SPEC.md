@@ -379,7 +379,7 @@ pub fn rebuild_index(
 
 `rebuild_index` may be public even if a backend does not persist a separate index. It gives callers a way to validate and inspect the graph.
 
-`focal-sqlite` opens graphs from a borrowed `rusqlite::Connection` and a graph namespace:
+`focal-sqlite` opens graphs from a borrowed mutable `rusqlite::Connection` and a graph namespace:
 
 ```rust
 use std::path::Path;
@@ -387,7 +387,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 pub struct IdeaGraph<'conn> {
-    connection: &'conn Connection,
+    connection: &'conn mut Connection,
     graph_name: String,
 }
 
@@ -399,7 +399,7 @@ pub fn init_graph<'conn>(
 ) -> Result<IdeaGraph<'conn>, GraphError>;
 
 pub fn open_graph<'conn>(
-    connection: &'conn Connection,
+    connection: &'conn mut Connection,
     graph_name: &str,
 ) -> Result<IdeaGraph<'conn>, GraphError>;
 
@@ -475,7 +475,7 @@ pub fn rebuild_index(
 ) -> Result<GraphIndex, GraphError>;
 ```
 
-The `focal-sqlite` graph handle borrows the caller-provided connection and must not own or close it. Mutating operations take `&mut IdeaGraph`; read, list, traversal, and validation operations take `&IdeaGraph`.
+The `focal-sqlite` graph handle mutably borrows the caller-provided connection and must not own or close it. Mutating operations take `&mut IdeaGraph`; read, list, traversal, and validation operations take `&IdeaGraph`.
 
 `open_database` is a convenience helper for callers that want the crate to create a `rusqlite::Connection` from a database path. Callers may also construct and configure their own `rusqlite::Connection` and pass it to `init_graph` or `open_graph`.
 
@@ -960,7 +960,7 @@ Initialization:
 
 - `open_database(path)` should create a `rusqlite::Connection` from a database path for callers that want a convenience helper.
 - `init_graph(&mut Connection, graph_name)` should create or migrate the required shared SQLite schema if missing, then create the named graph namespace if missing.
-- `open_graph(&Connection, graph_name)` should validate that the required shared schema and named graph namespace already exist before returning an `IdeaGraph`.
+- `open_graph(&mut Connection, graph_name)` should validate that the required shared schema and named graph namespace already exist before returning an `IdeaGraph`.
 - The `IdeaGraph` handle should borrow the caller-provided `rusqlite::Connection` and must not own or close it.
 - The crate owns schema creation and migration through `init_graph`; callers own the connection lifecycle and may configure the `rusqlite::Connection` themselves.
 
