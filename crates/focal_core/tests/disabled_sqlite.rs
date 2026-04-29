@@ -30,6 +30,11 @@ fn assert_disabled<T: Debug>(result: Result<T, Error>) {
 fn disabled_sqlite_backend_returns_disabled_error_for_every_operation() {
     let mut backend = core::disabled_sqlite("main");
 
+    match &backend {
+        core::Backend::Sqlite(sqlite) => assert_eq!(sqlite.graph_name(), "main"),
+        _ => panic!("expected disabled sqlite backend"),
+    }
+
     assert_disabled::<NodeId>(core::add_root_node(&mut backend, statement()));
     assert_disabled::<NodeId>(core::add_child_node(&mut backend, PARENT_ID, statement()));
     assert_disabled::<Node>(core::read_node(&backend, CHILD_ID));

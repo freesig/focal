@@ -98,3 +98,15 @@ fn fs_backend_errors_are_typed_core_errors() {
         other => panic!("expected typed filesystem error, got {other:?}"),
     }
 }
+
+#[test]
+fn fs_backend_error_wrapper_converts_with_from() {
+    let backend_error = focal_fs::Error::from(GraphError::NodeNotFound("missing".to_string()));
+    let core_error = Error::from(backend_error);
+
+    assert!(matches!(
+        core_error,
+        Error::Fs(error)
+            if matches!(error.as_graph_error(), GraphError::NodeNotFound(id) if id == "missing")
+    ));
+}

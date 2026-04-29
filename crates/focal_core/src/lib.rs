@@ -27,8 +27,8 @@ pub enum Backend<'conn> {
 #[cfg(not(feature = "sqlite"))]
 #[derive(Debug)]
 pub struct EmptySqlite<'conn> {
-    pub graph_name: String,
-    pub _lifetime: PhantomData<&'conn mut ()>,
+    graph_name: String,
+    _lifetime: PhantomData<&'conn mut ()>,
 }
 
 #[cfg(not(feature = "sqlite"))]

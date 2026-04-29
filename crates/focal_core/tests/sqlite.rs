@@ -98,3 +98,15 @@ fn sqlite_backend_errors_are_typed_core_errors() {
         other => panic!("expected typed sqlite error, got {other:?}"),
     }
 }
+
+#[test]
+fn sqlite_backend_error_wrapper_converts_with_from() {
+    let backend_error = focal_sqlite::Error::from(GraphError::NodeNotFound("missing".to_string()));
+    let core_error = Error::from(backend_error);
+
+    assert!(matches!(
+        core_error,
+        Error::Sqlite(error)
+            if matches!(error.as_graph_error(), GraphError::NodeNotFound(id) if id == "missing")
+    ));
+}
