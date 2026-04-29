@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec Priority"
+  short_description: "Prioritize spec items for review"
+  default_prompt: "Use $spec-priority to prioritize the attached spec excerpt for human review before implementation."
