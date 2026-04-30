@@ -1339,6 +1339,16 @@ fn ensure_schema_exists(connection: &Connection) -> Result<(), GraphError> {
             "is_canonical",
         ],
     )?;
+    ensure_table_primary_key(connection, "focal_graphs", &["id"])?;
+    ensure_table_primary_key(connection, "focal_nodes", &["graph_id", "id"])?;
+    ensure_table_primary_key(connection, "focal_context_documents", &["graph_id", "id"])?;
+    ensure_table_primary_key(connection, "focal_placements", &["id"])?;
+    ensure_unique_key(connection, "focal_graphs", &["name"])?;
+    ensure_unique_key(
+        connection,
+        "focal_context_documents",
+        &["graph_id", "filename"],
+    )?;
     Ok(())
 }
 
@@ -1365,6 +1375,99 @@ fn ensure_table_columns(
         }
     }
     Ok(())
+}
+
+fn ensure_table_primary_key(
+    connection: &Connection,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<(), GraphError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })
+        .map_err(storage_error)?;
+    let mut key_columns = Vec::new();
+    for row in rows {
+        let (column, position) = row.map_err(storage_error)?;
+        if position > 0 {
+            key_columns.push((position, column));
+        }
+    }
+    key_columns.sort_by_key(|(position, _)| *position);
+    let actual = key_columns
+        .into_iter()
+        .map(|(_, column)| column)
+        .collect::<Vec<_>>();
+    if actual != required_columns {
+        return Err(invalid_schema(format!(
+            "`{table}` primary key must be ({})",
+            required_columns.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_unique_key(
+    connection: &Connection,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<(), GraphError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA index_list({table})"))
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })
+        .map_err(storage_error)?;
+    for row in rows {
+        let (index_name, unique) = row.map_err(storage_error)?;
+        if unique == 0 {
+            continue;
+        }
+        if index_columns(connection, &index_name)? == required_columns {
+            return Ok(());
+        }
+    }
+    Err(invalid_schema(format!(
+        "`{table}` must have a unique key on ({})",
+        required_columns.join(", ")
+    )))
+}
+
+fn index_columns(connection: &Connection, index_name: &str) -> Result<Vec<String>, GraphError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "PRAGMA index_info({})",
+            quote_identifier(index_name)
+        ))
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?))
+        })
+        .map_err(storage_error)?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row.map_err(storage_error)?);
+    }
+    columns.sort_by_key(|(position, _)| *position);
+    Ok(columns
+        .into_iter()
+        .map(|(_, column)| column)
+        .collect::<Vec<_>>())
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn invalid_schema(message: String) -> GraphError {
+    GraphError::InvalidGraphRoot(format!("invalid SQLite schema: {message}"))
 }
 
 fn insert_node(

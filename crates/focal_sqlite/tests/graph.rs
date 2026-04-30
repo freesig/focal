@@ -143,6 +143,116 @@ fn open_graph_requires_context_schema_table() {
 }
 
 #[test]
+fn open_graph_rejects_context_schema_without_required_constraints() {
+    let mut missing_primary_key = Connection::open_in_memory().unwrap();
+    missing_primary_key
+        .execute_batch(
+            "
+            CREATE TABLE focal_graphs (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE focal_nodes (
+                graph_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                statement_body TEXT,
+                qa_question TEXT,
+                qa_answer TEXT,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                PRIMARY KEY (graph_id, id)
+            );
+            CREATE TABLE focal_context_documents (
+                graph_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                title TEXT NOT NULL,
+                markdown TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                UNIQUE (graph_id, filename)
+            );
+            CREATE TABLE focal_placements (
+                id INTEGER PRIMARY KEY,
+                graph_id INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                logical_path TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL
+            );
+            INSERT INTO focal_graphs (name, created_at_unix) VALUES ('main', 1);
+            ",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        open_graph(&mut missing_primary_key, "main"),
+        Err(GraphError::InvalidGraphRoot(message))
+            if message.contains("focal_context_documents")
+                && message.contains("primary key")
+    ));
+
+    let mut missing_filename_unique = Connection::open_in_memory().unwrap();
+    missing_filename_unique
+        .execute_batch(
+            "
+            CREATE TABLE focal_graphs (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE focal_nodes (
+                graph_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                statement_body TEXT,
+                qa_question TEXT,
+                qa_answer TEXT,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                PRIMARY KEY (graph_id, id)
+            );
+            CREATE TABLE focal_context_documents (
+                graph_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                title TEXT NOT NULL,
+                markdown TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                PRIMARY KEY (graph_id, id)
+            );
+            CREATE TABLE focal_placements (
+                id INTEGER PRIMARY KEY,
+                graph_id INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                logical_path TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL
+            );
+            INSERT INTO focal_graphs (name, created_at_unix) VALUES ('main', 1);
+            ",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        open_graph(&mut missing_filename_unique, "main"),
+        Err(GraphError::InvalidGraphRoot(message))
+            if message.contains("focal_context_documents")
+                && message.contains("unique key")
+                && message.contains("filename")
+    ));
+}
+
+#[test]
 fn context_documents_crud_namespace_sort_and_stable_filename() {
     let mut connection = Connection::open_in_memory().unwrap();
     let (root, alpha, beta, original_filename, original_path) = {
