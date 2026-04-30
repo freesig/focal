@@ -65,7 +65,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - **Context document**: One editable original idea context Markdown document. Context documents are graph-level records and are not linked to individual nodes in the first version.
 - **Context directory**: For `focal-fs`, the top-level `<graph-root>/context/` directory containing context Markdown files.
 - **Node**: One idea entry. A node is either a statement or a question-answer pair.
-- **Alternative answer**: A non-primary high-possibility answer for a question-answer node. Alternative answers are ordered from most likely to least likely after the primary answer.
+- **Alternative answer**: A caller-provided answer intended to be a non-primary high-possibility answer for a question-answer node. Alternative answers are ordered from most likely to least likely after the primary answer, and the library preserves the caller-provided strings without comparing them to the primary answer.
 - **Node directory**: For `focal-fs`, the directory that contains one node's `node.md` file and `children/` directory.
 - **Canonical node directory**: For `focal-fs`, the real directory that owns the node's Markdown and children.
 - **Alias node directory**: For `focal-fs`, a symlink to a canonical node directory.
@@ -256,15 +256,15 @@ For a question-answer node:
 
 - The question is the Markdown content under `## Question`.
 - The answer is the Markdown content under `## Answer`.
-- Alternative answers are top-level Markdown list items under `## Alternative answers`; library-created files must write each item with a `- ` marker.
+- Alternative answers are top-level Markdown list items under `## Alternative answers` using a `- ` marker; other Markdown list markers are rejected. Library-created files must write each item with a `- ` marker.
 - The `## Answer` content is the most likely answer.
-- Alternative answers are other high-possibility answers, ordered from most likely to least likely after the primary answer.
+- Alternative answers are caller-provided high-possibility answers intended to be non-primary, ordered from most likely to least likely after the primary answer.
 - Alternative answers are optional. An empty `## Alternative answers` section represents no alternative answers.
 - Blank lines in an empty or non-empty `## Alternative answers` section are allowed.
 - The `## Alternative answers` section is required even when it is empty.
-- The public alternative answer list contains only non-primary alternatives and must not include the primary `## Answer`.
+- The public alternative answer list stores only caller-provided alternatives. The library must not synthesize the primary `## Answer` into this list, and it does not reject or deduplicate an alternative answer whose text equals the primary answer.
 - The library must reject `qa` files missing `## Question`, `## Answer`, or `## Alternative answers`.
-- The library must reject non-empty `## Alternative answers` sections that contain content outside top-level Markdown list items.
+- The library must reject non-empty `## Alternative answers` sections that contain content outside top-level `- ` Markdown list items, including list items written with any other marker.
 
 ### Original Idea Context Markdown
 
@@ -417,7 +417,7 @@ pub struct ContextSummary {
 
 The implementation may add private fields, but public types should stay small and easy to construct in tests.
 
-For `NodeContent::QuestionAnswer`, `alternative_answers` stores only non-primary alternatives. The primary answer is stored only in `answer`. An empty `alternative_answers` vector represents a valid question-answer node with no alternatives.
+For `NodeContent::QuestionAnswer`, `alternative_answers` stores caller-provided alternatives that are intended to be non-primary. The primary answer is stored only in `answer`, and the library does not compare or deduplicate alternative answers against the primary answer. An empty `alternative_answers` vector represents a valid question-answer node with no alternatives.
 
 For `focal-fs`, `canonical_path`, `alias_paths`, and `GraphEdge.path` are filesystem paths. For `focal-sqlite`, those fields are logical graph paths built from the same slug and node ID format, such as `roots/parent--<id>/children/child--<id>`. They identify the same canonical and alias placements but must not imply that files or directories exist on disk.
 
@@ -1046,6 +1046,7 @@ Input validation:
 - Alternative answers are optional and may be an empty list, but the `## Alternative answers` section must exist for `qa` Markdown.
 - Each provided alternative answer must not be empty after trimming.
 - Alternative answers must be stored in caller-provided order, from most likely to least likely after the primary answer.
+- The library must not reject an alternative answer solely because its text equals the primary answer; callers are responsible for providing meaningful non-primary alternatives.
 - Node ID must be unique.
 - Context document title must not be empty after trimming.
 - Context document Markdown body may be empty.
@@ -1058,7 +1059,7 @@ Input validation:
 - Locate a node by ID anywhere in the graph.
 - Parse metadata.
 - Parse content according to `kind`.
-- For question-answer nodes, return alternative answers in stored order without including the primary answer.
+- For question-answer nodes, return stored alternative answers in stored order. The library must not synthesize or append the primary answer to the alternative answer list.
 - Return canonical path and alias paths. For `focal-sqlite`, these are logical graph paths.
 - For `focal-fs`, return an error if multiple real canonical directories claim the same ID.
 - For `focal-fs`, return an error if the node is found only as a broken symlink.
@@ -1329,13 +1330,13 @@ Adding:
 - Reject empty context document titles.
 - Reject empty questions for `qa` nodes.
 - Reject question-answer Markdown that omits the required `## Alternative answers` section.
-- Reject non-empty alternative answer sections that are not written as Markdown list items.
+- Reject non-empty alternative answer sections that are not written as top-level `- ` Markdown list items.
 
 Reading:
 
 - Read a statement node from its ID.
 - Read a question-answer node from its ID.
-- Read a question-answer node and verify ordered alternative answers are returned without the primary answer duplicated in the list.
+- Read a question-answer node and verify ordered alternative answers are returned without synthesizing the primary answer into the list.
 - Read a context document from its ID.
 - List context documents in deterministic order.
 - For `focal-fs`, read a node through a symlink parent and get the canonical content.
