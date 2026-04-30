@@ -32,6 +32,7 @@ pub(crate) struct ScannedNode {
     pub id: String,
     pub kind: NodeKind,
     pub title: String,
+    pub reviewed: bool,
     pub content: NodeContent,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
@@ -48,6 +49,7 @@ pub(crate) fn node_summary(node: &ScannedNode, is_alias: bool) -> Option<NodeSum
         id: node.id.clone(),
         kind: node.kind.clone(),
         title: node.title.clone(),
+        reviewed: node.reviewed,
         canonical_path: canonical_path(node)?.to_path_buf(),
         is_alias,
     })
@@ -669,6 +671,7 @@ fn scanned_node_from_parsed(parsed: &ParsedMarkdown) -> ScannedNode {
         id: parsed.id.clone(),
         kind: parsed.kind.clone(),
         title: parsed.title.clone(),
+        reviewed: parsed.reviewed,
         content: parsed.content.clone(),
         created_at_unix: parsed.created_at_unix,
         updated_at_unix: parsed.updated_at_unix,
@@ -844,6 +847,7 @@ mod tests {
             id: id.to_string(),
             kind: NodeKind::Statement,
             title: title.to_string(),
+            reviewed: false,
             content: NodeContent::Statement {
                 body: String::new(),
             },

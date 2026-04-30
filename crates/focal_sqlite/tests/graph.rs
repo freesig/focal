@@ -116,6 +116,7 @@ fn open_graph_requires_context_schema_table() {
                 id TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 title TEXT NOT NULL,
+                reviewed INTEGER NOT NULL,
                 statement_body TEXT,
                 qa_question TEXT,
                 qa_answer TEXT,
@@ -144,6 +145,69 @@ fn open_graph_requires_context_schema_table() {
 }
 
 #[test]
+fn open_graph_rejects_node_schema_missing_reviewed_column() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE focal_graphs (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE focal_nodes (
+                graph_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                statement_body TEXT,
+                qa_question TEXT,
+                qa_answer TEXT,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                PRIMARY KEY (graph_id, id)
+            );
+            CREATE TABLE focal_qa_alternative_answers (
+                graph_id INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                answer_order INTEGER NOT NULL,
+                answer TEXT NOT NULL,
+                PRIMARY KEY (graph_id, node_id, answer_order)
+            );
+            CREATE TABLE focal_context_documents (
+                graph_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                title TEXT NOT NULL,
+                markdown TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                PRIMARY KEY (graph_id, id),
+                UNIQUE (graph_id, filename)
+            );
+            CREATE TABLE focal_placements (
+                id INTEGER PRIMARY KEY,
+                graph_id INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                logical_path TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL
+            );
+            INSERT INTO focal_graphs (name, created_at_unix) VALUES ('main', 1);
+            ",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        open_graph(&mut connection, "main"),
+        Err(GraphError::InvalidGraphRoot(message))
+            if message.contains("focal_nodes.reviewed")
+    ));
+}
+
+#[test]
 fn open_graph_rejects_context_schema_without_required_constraints() {
     let mut missing_primary_key = Connection::open_in_memory().unwrap();
     missing_primary_key
@@ -159,6 +223,7 @@ fn open_graph_rejects_context_schema_without_required_constraints() {
                 id TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 title TEXT NOT NULL,
+                reviewed INTEGER NOT NULL,
                 statement_body TEXT,
                 qa_question TEXT,
                 qa_answer TEXT,
@@ -219,6 +284,7 @@ fn open_graph_rejects_context_schema_without_required_constraints() {
                 id TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 title TEXT NOT NULL,
+                reviewed INTEGER NOT NULL,
                 statement_body TEXT,
                 qa_question TEXT,
                 qa_answer TEXT,
@@ -463,6 +529,7 @@ fn add_read_update_and_path_stability() {
 
     let root_node = read_node(&graph, &root).unwrap();
     assert_eq!(root_node.title, "Rust keeps local tools simple");
+    assert!(!root_node.reviewed);
     assert!(
         root_node
             .canonical_path
@@ -486,14 +553,48 @@ fn add_read_update_and_path_stability() {
             content: Some(NodeContent::Statement {
                 body: "Updated body".to_string(),
             }),
+            reviewed: None,
         },
     )
     .unwrap();
 
     assert_eq!(updated.id, root);
     assert_eq!(updated.title, "A better title");
+    assert!(!updated.reviewed);
     assert_eq!(updated.canonical_path, original_path);
     assert!(updated.updated_at_unix > root_node.updated_at_unix);
+    let reviewed = update_node(
+        &mut graph,
+        &root,
+        NodePatch {
+            title: None,
+            content: None,
+            reviewed: Some(true),
+        },
+    )
+    .unwrap();
+    assert!(reviewed.reviewed);
+    assert_eq!(reviewed.content, updated.content);
+    assert_eq!(reviewed.canonical_path, updated.canonical_path);
+    assert!(list_roots(&graph).unwrap()[0].reviewed);
+    assert!(
+        rebuild_index(&graph)
+            .unwrap()
+            .nodes
+            .iter()
+            .any(|node| { node.id == root && node.reviewed })
+    );
+    let unreviewed = update_node(
+        &mut graph,
+        &root,
+        NodePatch {
+            title: None,
+            content: None,
+            reviewed: Some(false),
+        },
+    )
+    .unwrap();
+    assert!(!unreviewed.reviewed);
     assert_eq!(
         list_children(&graph, &root)
             .unwrap()
@@ -534,6 +635,7 @@ fn root_question_answer_nodes_update_without_path_changes() {
                     "The original alternatives were replaced.".to_string(),
                 ],
             }),
+            reviewed: None,
         },
     )
     .unwrap();
@@ -600,6 +702,7 @@ fn question_answer_alternative_answers_round_trip_in_order_and_replace_on_update
                 answer: "The revised primary answer.".to_string(),
                 alternative_answers: vec!["The replacement alternative.".to_string()],
             }),
+            reviewed: None,
         },
     )
     .unwrap();
@@ -937,12 +1040,13 @@ fn rebuild_index_reports_sorted_nodes_edges_and_alias_edges() {
 #[test]
 fn rebuild_index_reports_sqlite_storage_problems() {
     let mut connection = Connection::open_in_memory().unwrap();
-    let (graph, parent, child, qa_node, mismatch, parent_path, child_path) = {
+    let (graph, parent, child, qa_node, mismatch, bad_reviewed, parent_path, child_path) = {
         let mut graph = init_graph(&mut connection, "main").unwrap();
         let parent = add_root_node(&mut graph, statement("Parent", "")).unwrap();
         let child = add_child_node(&mut graph, &parent, statement("Child", "")).unwrap();
         let qa_node = add_root_node(&mut graph, qa("Question", "Why?", "")).unwrap();
         let mismatch = add_root_node(&mut graph, statement("Mismatch", "")).unwrap();
+        let bad_reviewed = add_root_node(&mut graph, statement("Bad Reviewed", "")).unwrap();
         let parent_path = read_node(&graph, &parent)
             .unwrap()
             .canonical_path
@@ -959,6 +1063,7 @@ fn rebuild_index_reports_sqlite_storage_problems() {
             child,
             qa_node,
             mismatch,
+            bad_reviewed,
             parent_path,
             child_path,
         )
@@ -1010,6 +1115,13 @@ fn rebuild_index_reports_sqlite_storage_problems() {
         .unwrap();
     connection
         .execute(
+            "UPDATE focal_nodes \
+             SET reviewed = 2 WHERE graph_id = ?1 AND id = ?2",
+            params![graph, bad_reviewed],
+        )
+        .unwrap();
+    connection
+        .execute(
             "INSERT INTO focal_qa_alternative_answers \
              (graph_id, node_id, answer_order, answer) \
              VALUES (?1, ?2, 0, '')",
@@ -1019,9 +1131,9 @@ fn rebuild_index_reports_sqlite_storage_problems() {
     connection
         .execute(
             "INSERT INTO focal_nodes \
-             (graph_id, id, kind, title, statement_body, qa_question, qa_answer, \
+             (graph_id, id, kind, title, reviewed, statement_body, qa_question, qa_answer, \
               created_at_unix, updated_at_unix) \
-             VALUES (?1, 'not-a-uuid', 'statement', 'Bad ID', 'body', NULL, NULL, 1, 1)",
+             VALUES (?1, 'not-a-uuid', 'statement', 'Bad ID', 0, 'body', NULL, NULL, 1, 1)",
             params![graph],
         )
         .unwrap();
@@ -1080,6 +1192,10 @@ fn rebuild_index_reports_sqlite_storage_problems() {
     assert!(problems.iter().any(|problem| matches!(
         problem,
         GraphProblem::InvalidMarkdown { reason, .. } if reason == "question must not be empty"
+    )));
+    assert!(problems.iter().any(|problem| matches!(
+        problem,
+        GraphProblem::InvalidMarkdown { reason, .. } if reason == "invalid reviewed value `2`"
     )));
     assert!(problems.iter().any(|problem| matches!(
         problem,

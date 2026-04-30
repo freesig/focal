@@ -53,6 +53,7 @@ fn sqlite_backend_dispatches_shared_operations() {
             content: Some(NodeContent::Statement {
                 body: "updated".to_string(),
             }),
+            reviewed: None,
         },
     )
     .unwrap();

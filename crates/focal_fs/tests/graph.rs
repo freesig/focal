@@ -63,6 +63,7 @@ fn init_open_add_read_and_update_nodes() {
     let node = read_node(&graph, &id).unwrap();
     assert_eq!(node.id, id);
     assert_eq!(node.title, "Rust keeps local tools simple");
+    assert!(!node.reviewed);
     assert!(
         node.canonical_path
             .ends_with(format!("rust-keeps-local-tools-simple--{}", node.id))
@@ -85,11 +86,13 @@ fn init_open_add_read_and_update_nodes() {
             content: Some(NodeContent::Statement {
                 body: "Updated body".to_string(),
             }),
+            reviewed: None,
         },
     )
     .unwrap();
     assert_eq!(updated.id, id);
     assert_eq!(updated.title, "A better title");
+    assert!(!updated.reviewed);
     assert_eq!(updated.canonical_path, original_path);
     assert!(updated.updated_at_unix > node.updated_at_unix);
     assert_eq!(
@@ -101,7 +104,44 @@ fn init_open_add_read_and_update_nodes() {
 
     let markdown = fs::read_to_string(updated.canonical_path.join("node.md")).unwrap();
     assert!(markdown.contains("title: A better title"));
+    assert!(markdown.contains("reviewed: false"));
     assert!(!markdown.contains("# A better title"));
+
+    let reviewed = update_node(
+        &graph,
+        &id,
+        NodePatch {
+            title: None,
+            content: None,
+            reviewed: Some(true),
+        },
+    )
+    .unwrap();
+    assert!(reviewed.reviewed);
+    assert_eq!(reviewed.content, updated.content);
+    assert_eq!(reviewed.canonical_path, updated.canonical_path);
+    assert!(reviewed.updated_at_unix > updated.updated_at_unix);
+    assert!(
+        fs::read_to_string(reviewed.canonical_path.join("node.md"))
+            .unwrap()
+            .contains("reviewed: true")
+    );
+    assert!(list_roots(&graph).unwrap()[0].reviewed);
+    assert!(rebuild_index(&graph).unwrap().nodes[0].reviewed);
+
+    let unreviewed = update_node(
+        &graph,
+        &id,
+        NodePatch {
+            title: None,
+            content: None,
+            reviewed: Some(false),
+        },
+    )
+    .unwrap();
+    assert!(!unreviewed.reviewed);
+    assert_eq!(unreviewed.content, reviewed.content);
+    assert_eq!(unreviewed.canonical_path, reviewed.canonical_path);
 }
 
 #[test]
@@ -582,15 +622,25 @@ fn read_node_surfaces_corrupt_existing_node_files() {
     let graph = init_graph(temp.path()).unwrap();
     let missing = add_root_node(&graph, statement("Missing Markdown", "")).unwrap();
     let invalid = add_root_node(&graph, statement("Invalid Markdown", "")).unwrap();
+    let invalid_reviewed = add_root_node(&graph, statement("Invalid Reviewed", "")).unwrap();
     let missing_children =
         add_root_node(&graph, statement("Missing Children Directory", "")).unwrap();
     let missing_node = read_node(&graph, &missing).unwrap();
     let invalid_node = read_node(&graph, &invalid).unwrap();
+    let invalid_reviewed_node = read_node(&graph, &invalid_reviewed).unwrap();
     let missing_children_node = read_node(&graph, &missing_children).unwrap();
     let invalid_node_file = invalid_node.canonical_path.join("node.md");
+    let invalid_reviewed_file = invalid_reviewed_node.canonical_path.join("node.md");
 
     fs::remove_file(missing_node.canonical_path.join("node.md")).unwrap();
     fs::write(&invalid_node_file, "not front matter").unwrap();
+    fs::write(
+        &invalid_reviewed_file,
+        fs::read_to_string(&invalid_reviewed_file)
+            .unwrap()
+            .replace("reviewed: false", "reviewed: maybe"),
+    )
+    .unwrap();
     fs::remove_dir_all(missing_children_node.canonical_path.join("children")).unwrap();
 
     assert!(matches!(
@@ -600,6 +650,11 @@ fn read_node_surfaces_corrupt_existing_node_files() {
     assert!(matches!(
         read_node(&graph, &invalid),
         Err(GraphError::InvalidMarkdown { path, .. }) if path == invalid_node_file
+    ));
+    assert!(matches!(
+        read_node(&graph, &invalid_reviewed),
+        Err(GraphError::InvalidMarkdown { path, reason })
+            if path == invalid_reviewed_file && reason == "invalid boolean `maybe`"
     ));
     assert!(matches!(
         read_node(&graph, &missing_children),
@@ -624,6 +679,7 @@ fn rejects_invalid_inputs_and_ids() {
             NodePatch {
                 title: Some("bad\ntitle".to_string()),
                 content: None,
+                reviewed: None,
             },
         ),
         Err(GraphError::InvalidTitle)
@@ -1152,6 +1208,7 @@ fn question_answer_updates_keep_identity_paths_and_managed_sections() {
                     "A less likely answer.".to_string(),
                 ],
             }),
+            reviewed: None,
         },
     )
     .unwrap();

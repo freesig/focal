@@ -27,6 +27,7 @@ mod tests {
             id: id.clone(),
             kind: NodeKind::Statement,
             title: "Title".to_string(),
+            reviewed: false,
             content: content.clone(),
             created_at_unix: 1,
             updated_at_unix: 2,
@@ -41,19 +42,24 @@ mod tests {
         let patch = NodePatch {
             title: Some("New title".to_string()),
             content: Some(content.clone()),
+            reviewed: Some(true),
         };
         let summary = NodeSummary {
             id,
             kind: NodeKind::Statement,
             title: node.title.clone(),
+            reviewed: node.reviewed,
             canonical_path: node.canonical_path.clone(),
             is_alias: false,
         };
 
         assert_eq!(node.content, content);
+        assert!(!node.reviewed);
         assert_eq!(new_node.kind, NodeKind::Statement);
         assert_eq!(patch.title.as_deref(), Some("New title"));
+        assert_eq!(patch.reviewed, Some(true));
         assert_eq!(summary.title, "Title");
+        assert!(!summary.reviewed);
     }
 
     #[test]

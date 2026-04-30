@@ -195,6 +195,7 @@ pub fn update_node(graph: &IdeaGraph, node_id: &str, patch: NodePatch) -> Result
         }
         None => node.content.clone(),
     };
+    let reviewed = patch.reviewed.unwrap_or(node.reviewed);
     let updated_at_unix = now_unix().max(node.updated_at_unix.saturating_add(1));
     write_node_markdown(
         canonical_path,
@@ -203,6 +204,7 @@ pub fn update_node(graph: &IdeaGraph, node_id: &str, patch: NodePatch) -> Result
         &title,
         node.created_at_unix,
         updated_at_unix,
+        reviewed,
         &content,
     )?;
 
@@ -496,6 +498,7 @@ fn create_node_in_container(
         &node.title,
         created_at_unix,
         created_at_unix,
+        false,
         &node.content,
     )?;
 
@@ -509,9 +512,18 @@ fn write_node_markdown(
     title: &str,
     created_at_unix: u64,
     updated_at_unix: u64,
+    reviewed: bool,
     content: &NodeContent,
 ) -> Result<(), GraphError> {
-    let markdown = render_node_markdown(id, kind, title, created_at_unix, updated_at_unix, content);
+    let markdown = render_node_markdown(
+        id,
+        kind,
+        title,
+        created_at_unix,
+        updated_at_unix,
+        reviewed,
+        content,
+    );
     let node_file = node_file_path(node_dir);
     write_file_atomically(node_dir, &node_file, &markdown)
 }
@@ -521,6 +533,7 @@ fn node_from_scanned(node: &ScannedNode) -> Result<Node, GraphError> {
         id: node.id.clone(),
         kind: node.kind.clone(),
         title: node.title.clone(),
+        reviewed: node.reviewed,
         content: node.content.clone(),
         created_at_unix: node.created_at_unix,
         updated_at_unix: node.updated_at_unix,

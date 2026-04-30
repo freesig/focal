@@ -16,6 +16,7 @@ pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
     pub title: String,
+    pub reviewed: bool,
     pub content: NodeContent,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
@@ -46,6 +47,7 @@ pub struct NewNode {
 pub struct NodePatch {
     pub title: Option<String>,
     pub content: Option<NodeContent>,
+    pub reviewed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +55,7 @@ pub struct NodeSummary {
     pub id: NodeId,
     pub kind: NodeKind,
     pub title: String,
+    pub reviewed: bool,
     pub canonical_path: PathBuf,
     pub is_alias: bool,
 }

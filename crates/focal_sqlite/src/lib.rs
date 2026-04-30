@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS focal_nodes (
     id TEXT NOT NULL,
     kind TEXT NOT NULL,
     title TEXT NOT NULL,
+    reviewed INTEGER NOT NULL,
     statement_body TEXT,
     qa_question TEXT,
     qa_answer TEXT,
@@ -397,12 +398,22 @@ pub fn update_node(
         }
         None => node.content.clone(),
     };
+    let reviewed = patch.reviewed.unwrap_or(node.reviewed);
     let updated_at_unix = now_unix().max(node.updated_at_unix.saturating_add(1));
-    update_node_row(&tx, graph_id, node_id, &title, &content, updated_at_unix)?;
+    update_node_row(
+        &tx,
+        graph_id,
+        node_id,
+        &title,
+        reviewed,
+        &content,
+        updated_at_unix,
+    )?;
     let updated = Node {
         id: node.id.clone(),
         kind: node.kind.clone(),
         title,
+        reviewed,
         content,
         created_at_unix: node.created_at_unix,
         updated_at_unix,
@@ -653,6 +664,7 @@ struct ScannedNode {
     id: String,
     kind: NodeKind,
     title: String,
+    reviewed: bool,
     content: NodeContent,
     created_at_unix: u64,
     updated_at_unix: u64,
@@ -699,6 +711,7 @@ struct RawNode {
     id: String,
     kind: String,
     title: String,
+    reviewed: i64,
     statement_body: Option<String>,
     qa_question: Option<String>,
     qa_answer: Option<String>,
@@ -1079,6 +1092,19 @@ fn scanned_node_from_raw(
         .map_err(|problem| (id.clone(), problem))?;
     let updated_at_unix = non_negative_unix(raw_node.updated_at_unix, path, "updated_at_unix")
         .map_err(|problem| (id.clone(), problem))?;
+    let reviewed = match raw_node.reviewed {
+        0 => false,
+        1 => true,
+        other => {
+            return Err((
+                id,
+                GraphProblem::InvalidMarkdown {
+                    path: path.to_path_buf(),
+                    reason: format!("invalid reviewed value `{other}`"),
+                },
+            ));
+        }
+    };
     let content = match kind {
         NodeKind::Statement => match (
             raw_node.statement_body,
@@ -1134,6 +1160,7 @@ fn scanned_node_from_raw(
         id,
         kind,
         title: raw_node.title,
+        reviewed,
         content,
         created_at_unix,
         updated_at_unix,
@@ -1227,7 +1254,7 @@ fn scanned_placement_from_raw(
 fn query_raw_nodes(connection: &Connection, graph_id: i64) -> Result<Vec<RawNode>, GraphError> {
     let mut statement = connection
         .prepare(
-            "SELECT id, kind, title, statement_body, qa_question, qa_answer, \
+            "SELECT id, kind, title, reviewed, statement_body, qa_question, qa_answer, \
              created_at_unix, updated_at_unix \
              FROM focal_nodes WHERE graph_id = ?1 ORDER BY id",
         )
@@ -1238,11 +1265,12 @@ fn query_raw_nodes(connection: &Connection, graph_id: i64) -> Result<Vec<RawNode
                 id: row.get(0)?,
                 kind: row.get(1)?,
                 title: row.get(2)?,
-                statement_body: row.get(3)?,
-                qa_question: row.get(4)?,
-                qa_answer: row.get(5)?,
-                created_at_unix: row.get(6)?,
-                updated_at_unix: row.get(7)?,
+                reviewed: row.get(3)?,
+                statement_body: row.get(4)?,
+                qa_question: row.get(5)?,
+                qa_answer: row.get(6)?,
+                created_at_unix: row.get(7)?,
+                updated_at_unix: row.get(8)?,
             })
         })
         .map_err(storage_error)?;
@@ -1456,6 +1484,7 @@ fn ensure_schema_exists(connection: &Connection) -> Result<(), GraphError> {
             "id",
             "kind",
             "title",
+            "reviewed",
             "statement_body",
             "qa_question",
             "qa_answer",
@@ -1643,14 +1672,15 @@ fn insert_node(
     connection
         .execute(
             "INSERT INTO focal_nodes \
-             (graph_id, id, kind, title, statement_body, qa_question, qa_answer, \
+             (graph_id, id, kind, title, reviewed, statement_body, qa_question, qa_answer, \
               created_at_unix, updated_at_unix) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 graph_id,
                 id,
                 kind,
                 node.title,
+                0_i64,
                 statement_body,
                 qa_question,
                 qa_answer,
@@ -1668,6 +1698,7 @@ fn update_node_row(
     graph_id: i64,
     node_id: &str,
     title: &str,
+    reviewed: bool,
     content: &NodeContent,
     updated_at_unix: u64,
 ) -> Result<(), GraphError> {
@@ -1675,11 +1706,12 @@ fn update_node_row(
     let rows = connection
         .execute(
             "UPDATE focal_nodes \
-             SET title = ?1, statement_body = ?2, qa_question = ?3, qa_answer = ?4, \
-                 updated_at_unix = ?5 \
-             WHERE graph_id = ?6 AND id = ?7",
+             SET title = ?1, reviewed = ?2, statement_body = ?3, qa_question = ?4, qa_answer = ?5, \
+                 updated_at_unix = ?6 \
+             WHERE graph_id = ?7 AND id = ?8",
             params![
                 title,
+                if reviewed { 1_i64 } else { 0_i64 },
                 statement_body,
                 qa_question,
                 qa_answer,
@@ -2341,6 +2373,7 @@ fn node_summary(node: &ScannedNode, is_alias: bool) -> Option<NodeSummary> {
         id: node.id.clone(),
         kind: node.kind.clone(),
         title: node.title.clone(),
+        reviewed: node.reviewed,
         canonical_path: canonical_path(node)?.to_path_buf(),
         is_alias,
     })
@@ -2355,6 +2388,7 @@ fn node_from_scanned(node: &ScannedNode) -> Result<Node, GraphError> {
         id: node.id.clone(),
         kind: node.kind.clone(),
         title: node.title.clone(),
+        reviewed: node.reviewed,
         content: node.content.clone(),
         created_at_unix: node.created_at_unix,
         updated_at_unix: node.updated_at_unix,

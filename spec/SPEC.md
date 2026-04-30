@@ -34,6 +34,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - Provide a `focal-core` crate whose free-function API dispatches to `focal-fs` and, when the `sqlite` feature is enabled, `focal-sqlite` through a concrete `Backend` enum.
 - Support statement nodes and question-answer nodes.
 - Support optional alternative answers on question-answer nodes, ordered by likelihood after the primary answer.
+- Support marking and unmarking nodes as reviewed through node metadata.
 - Support creating, reading, updating, deleting, and listing graph-level original idea context documents.
 - Support graph navigation from any node.
 - Support listing ancestors and descendants.
@@ -65,6 +66,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - **Context document**: One editable original idea context Markdown document. Context documents are graph-level records and are not linked to individual nodes in the first version.
 - **Context directory**: For `focal-fs`, the top-level `<graph-root>/context/` directory containing context Markdown files.
 - **Node**: One idea entry. A node is either a statement or a question-answer pair.
+- **Reviewed state**: A boolean node metadata value indicating whether a caller has marked the node as reviewed.
 - **Alternative answer**: A caller-provided answer intended to be a non-primary high-possibility answer for a question-answer node. Alternative answers are ordered from most likely to least likely after the primary answer, and the library preserves the caller-provided strings without comparing them to the primary answer.
 - **Node directory**: For `focal-fs`, the directory that contains one node's `node.md` file and `children/` directory.
 - **Canonical node directory**: For `focal-fs`, the real directory that owns the node's Markdown and children.
@@ -198,11 +200,19 @@ Required metadata fields:
 - `title`
 - `created_at_unix`
 - `updated_at_unix`
+- `reviewed`
 
 Supported `kind` values:
 
 - `statement`
 - `qa`
+
+Supported `reviewed` values:
+
+- `true`
+- `false`
+
+The `reviewed` metadata field records whether the node has been marked reviewed. Library-created nodes start with `reviewed: false`. Missing or invalid `reviewed` values are invalid node Markdown.
 
 ### Statement Node Markdown
 
@@ -213,6 +223,7 @@ kind: statement
 title: Rust keeps local tools simple
 created_at_unix: 1777274701
 updated_at_unix: 1777274701
+reviewed: false
 ---
 
 Rust is a good fit for local graph tools because it can manage files safely
@@ -223,6 +234,7 @@ For a statement node:
 
 - The body is the Markdown content after the metadata block.
 - The title lives in metadata only.
+- The reviewed state lives in metadata only.
 - The library must not require, insert, remove, or manage a top-level `# Heading`.
 - The library should preserve body Markdown as much as possible when editing metadata only.
 
@@ -235,6 +247,7 @@ kind: qa
 title: Why use symlinks?
 created_at_unix: 1777274712
 updated_at_unix: 1777274712
+reviewed: false
 ---
 
 ## Question
@@ -263,6 +276,7 @@ For a question-answer node:
 - Blank lines in an empty or non-empty `## Alternative answers` section are allowed.
 - The `## Alternative answers` section is required even when it is empty.
 - The public alternative answer list stores only caller-provided alternatives. The library must not synthesize the primary `## Answer` into this list, and it does not reject or deduplicate an alternative answer whose text equals the primary answer.
+- The reviewed state lives in metadata only.
 - The library must reject `qa` files missing `## Question`, `## Answer`, or `## Alternative answers`.
 - The library must reject non-empty `## Alternative answers` sections that contain content outside top-level `- ` Markdown list items, including list items written with any other marker.
 
@@ -344,6 +358,7 @@ pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
     pub title: String,
+    pub reviewed: bool,
     pub content: NodeContent,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
@@ -372,6 +387,7 @@ pub struct NewNode {
 pub struct NodePatch {
     pub title: Option<String>,
     pub content: Option<NodeContent>,
+    pub reviewed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +395,7 @@ pub struct NodeSummary {
     pub id: NodeId,
     pub kind: NodeKind,
     pub title: String,
+    pub reviewed: bool,
     pub canonical_path: PathBuf,
     pub is_alias: bool,
 }
@@ -418,6 +435,8 @@ pub struct ContextSummary {
 The implementation may add private fields, but public types should stay small and easy to construct in tests.
 
 For `NodeContent::QuestionAnswer`, `alternative_answers` stores caller-provided alternatives that are intended to be non-primary. The primary answer is stored only in `answer`, and the library does not compare or deduplicate alternative answers against the primary answer. An empty `alternative_answers` vector represents a valid question-answer node with no alternatives.
+
+`Node.reviewed` and `NodeSummary.reviewed` expose the node metadata reviewed state. `NewNode` does not accept an initial reviewed value in the first version; every added node starts unreviewed. `NodePatch.reviewed: Some(true)` marks a node as reviewed, `Some(false)` unmarks it, and `None` leaves the reviewed state unchanged.
 
 For `focal-fs`, `canonical_path`, `alias_paths`, and `GraphEdge.path` are filesystem paths. For `focal-sqlite`, those fields are logical graph paths built from the same slug and node ID format, such as `roots/parent--<id>/children/child--<id>`. They identify the same canonical and alias placements but must not imply that files or directories exist on disk.
 
@@ -977,6 +996,8 @@ Traversal requirements:
 - Editing an answer.
 - Editing alternative answers.
 - Editing a title.
+- Marking a node as reviewed.
+- Unmarking a reviewed node.
 - Updating `updated_at_unix`.
 
 When title changes:
@@ -988,6 +1009,13 @@ When title changes:
 - Keep the node ID unchanged.
 - Keep parent and child relationships unchanged.
 - The directory slug or logical path slug remains stable and may become stale after a title edit.
+
+When reviewed state changes:
+
+- Rewrite the `reviewed` metadata field to `true` or `false`.
+- Update `updated_at_unix`.
+- Keep the node ID, title, content, canonical placement, alias placements, parents, and children unchanged.
+- Preserve body Markdown as much as possible.
 
 Markdown rewrite rules:
 
@@ -1017,6 +1045,7 @@ Adding a root node:
 
 - Creates a canonical placement under roots.
 - Stores node metadata and Markdown content.
+- Sets node metadata `reviewed: false`.
 - For `focal-fs`, creates a canonical node directory under `<graph-root>/roots/`, writes `node.md`, and creates `children/`.
 - Returns the generated node ID.
 
@@ -1025,6 +1054,7 @@ Adding a child node:
 - Finds the parent's canonical placement.
 - Creates a canonical placement under the parent.
 - Stores node metadata and Markdown content.
+- Sets node metadata `reviewed: false`.
 - For `focal-fs`, creates a canonical node directory under `<parent-dir>/children/`, writes `node.md`, and creates `children/`.
 - Returns the generated node ID.
 
@@ -1059,6 +1089,7 @@ Input validation:
 - Locate a node by ID anywhere in the graph.
 - Parse metadata.
 - Parse content according to `kind`.
+- Return the reviewed state from node metadata.
 - For question-answer nodes, return stored alternative answers in stored order. The library must not synthesize or append the primary answer to the alternative answer list.
 - Return canonical path and alias paths. For `focal-sqlite`, these are logical graph paths.
 - For `focal-fs`, return an error if multiple real canonical directories claim the same ID.
@@ -1276,6 +1307,7 @@ The library should expose a validation path through `rebuild_index`.
 - Node directories without `node.md`.
 - Node directories without `children/`.
 - Invalid Markdown metadata.
+- Invalid or missing reviewed metadata.
 - Duplicate node IDs.
 - Broken symlinks.
 - Cycles.
@@ -1325,6 +1357,7 @@ Adding:
 - Add a child question-answer node with an empty alternative answer list.
 - Add multiple context documents.
 - Verify generated node IDs are UUID strings.
+- Verify newly added nodes start unreviewed.
 - Verify generated context document IDs are UUID strings.
 - Reject empty titles.
 - Reject empty context document titles.
@@ -1349,6 +1382,9 @@ Editing:
 - Update answer text.
 - Update alternative answers.
 - Update title and verify metadata updates.
+- Mark a node reviewed and verify the metadata updates.
+- Unmark a reviewed node and verify the metadata updates.
+- Verify reviewed-only edits update `updated_at_unix` without changing content, IDs, or placements.
 - Verify title edits do not require a top-level `# Heading`.
 - Verify title edits do not rename the node directory or logical path.
 - Verify node ID remains stable across edits.
@@ -1477,7 +1513,7 @@ Storage requirements:
 
 - Store graph namespace metadata in SQLite.
 - Store context documents in SQLite with stable UUID context document IDs, filename, title, Markdown body, `created_at_unix`, and `updated_at_unix`.
-- Store nodes in SQLite with stable UUID node IDs, kind, title, Markdown content fields, ordered question-answer alternative answers, `created_at_unix`, and `updated_at_unix`.
+- Store nodes in SQLite with stable UUID node IDs, kind, title, reviewed state, Markdown content fields, ordered question-answer alternative answers, `created_at_unix`, and `updated_at_unix`.
 - Store parent-child relationships in SQLite as placement rows scoped to the graph namespace.
 - Each `(graph_name, context_id)` context document must be unique.
 - Each `(graph_name, filename)` context document filename should be unique.
@@ -1499,8 +1535,9 @@ Behavioral requirements:
 - `delete_context_document` deletes only the selected context document row and must not alter nodes, placements, or edges.
 - `list_context_documents` returns context summaries in deterministic order.
 - `add_root_node` and `add_child_node` insert node and placement rows scoped to the selected graph namespace instead of creating directories and Markdown files.
-- `read_node` returns node content from the canonical node row, including ordered question-answer alternative answers, with logical canonical and alias paths.
+- `read_node` returns node content and reviewed state from the canonical node row, including ordered question-answer alternative answers, with logical canonical and alias paths.
 - `update_node` updates question-answer alternative answers in caller-provided order when the patch replaces question-answer content.
+- `update_node` updates reviewed state and `updated_at_unix` when the patch marks or unmarks a node.
 - `link_existing_node` creates an alias placement row when the edge does not already exist, except when linking a root node with no other parents under a parent; in that case it moves the root's canonical placement under the new parent to match `focal-fs`.
 - `unlink_child` removes only the requested placement and applies the same orphan policies as `focal-fs`.
 - Promotion chooses the lexicographically first alias logical path and marks that placement canonical.
@@ -1605,6 +1642,17 @@ let descendants = list_descendants(
 
 assert_eq!(descendants[0].id, qa_id);
 
+let reviewed = update_node(
+    &graph,
+    &qa_id,
+    NodePatch {
+        reviewed: Some(true),
+        ..NodePatch::default()
+    },
+)?;
+
+assert!(reviewed.reviewed);
+
 let contexts = list_context_documents(&graph)?;
 assert_eq!(contexts[0].id, context_id);
 ```
@@ -1620,6 +1668,9 @@ The shared graph behavior is acceptable when:
 - For `focal-fs`, no `.idea-graph/VERSION` file is required.
 - Multiple original idea context Markdown documents can be added, read, updated, listed, and deleted.
 - Statement and question-answer nodes can be added, read, updated, and deleted.
+- Newly added nodes start with `reviewed: false` in their metadata.
+- Nodes can be marked and unmarked as reviewed by updating node metadata.
+- Reviewed metadata edits preserve node content, IDs, parents, children, canonical placements, and alias placements.
 - Question-answer nodes can store optional ordered alternative answers that are created, read, and updated through the public API.
 - Question-answer Markdown always includes `## Question`, `## Answer`, and `## Alternative answers` sections.
 - Generated node IDs are UUID strings.

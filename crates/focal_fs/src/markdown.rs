@@ -8,6 +8,7 @@ pub(crate) struct ParsedMarkdown {
     pub id: String,
     pub kind: NodeKind,
     pub title: String,
+    pub reviewed: bool,
     pub content: NodeContent,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
@@ -33,6 +34,7 @@ pub(crate) fn parse_node_markdown(path: &Path, source: &str) -> Result<ParsedMar
     let title = required_field(&metadata, "title")?.to_string();
     let created_at_unix = parse_unix(required_field(&metadata, "created_at_unix")?)?;
     let updated_at_unix = parse_unix(required_field(&metadata, "updated_at_unix")?)?;
+    let reviewed = parse_bool(required_field(&metadata, "reviewed")?)?;
 
     let content = match kind {
         NodeKind::Statement => NodeContent::Statement {
@@ -52,6 +54,7 @@ pub(crate) fn parse_node_markdown(path: &Path, source: &str) -> Result<ParsedMar
         id,
         kind,
         title,
+        reviewed,
         content,
         created_at_unix,
         updated_at_unix,
@@ -80,6 +83,7 @@ pub(crate) fn render_node_markdown(
     title: &str,
     created_at_unix: u64,
     updated_at_unix: u64,
+    reviewed: bool,
     content: &NodeContent,
 ) -> String {
     let kind_value = match kind {
@@ -104,7 +108,7 @@ pub(crate) fn render_node_markdown(
     };
 
     format!(
-        "---\nid: {id}\nkind: {kind_value}\ntitle: {title}\ncreated_at_unix: {created_at_unix}\nupdated_at_unix: {updated_at_unix}\n---\n\n{body}"
+        "---\nid: {id}\nkind: {kind_value}\ntitle: {title}\ncreated_at_unix: {created_at_unix}\nupdated_at_unix: {updated_at_unix}\nreviewed: {reviewed}\n---\n\n{body}"
     )
 }
 
@@ -183,6 +187,14 @@ fn parse_unix(value: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("invalid unix timestamp `{value}`"))
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("invalid boolean `{value}`")),
+    }
 }
 
 fn parse_question_answer(path: &Path, body: &str) -> Result<(String, String, Vec<String>), String> {
@@ -350,7 +362,7 @@ mod tests {
 
     fn metadata(id: &str, kind: &str, title: &str) -> String {
         format!(
-            "---\nid: {id}\nkind: {kind}\ntitle: {title}\ncreated_at_unix: 1\nupdated_at_unix: 2\n---\n\n"
+            "---\nid: {id}\nkind: {kind}\ntitle: {title}\ncreated_at_unix: 1\nupdated_at_unix: 2\nreviewed: false\n---\n\n"
         )
     }
 
@@ -361,10 +373,11 @@ mod tests {
             body: "# Human heading\n\nBody text\n".to_string(),
         };
 
-        let rendered = render_node_markdown(id, &NodeKind::Statement, "A Title", 10, 11, &content);
+        let rendered =
+            render_node_markdown(id, &NodeKind::Statement, "A Title", 10, 11, false, &content);
 
         assert!(rendered.starts_with(
-            "---\nid: 550e8400-e29b-41d4-a716-446655440000\nkind: statement\ntitle: A Title\ncreated_at_unix: 10\nupdated_at_unix: 11\n---\n\n"
+            "---\nid: 550e8400-e29b-41d4-a716-446655440000\nkind: statement\ntitle: A Title\ncreated_at_unix: 10\nupdated_at_unix: 11\nreviewed: false\n---\n\n"
         ));
         assert!(rendered.contains("# Human heading"));
 
@@ -372,6 +385,7 @@ mod tests {
         assert_eq!(parsed.id, id);
         assert_eq!(parsed.kind, NodeKind::Statement);
         assert_eq!(parsed.title, "A Title");
+        assert!(!parsed.reviewed);
         assert_eq!(parsed.content, content);
     }
 
@@ -384,6 +398,7 @@ mod tests {
             "Why",
             1,
             1,
+            true,
             &NodeContent::QuestionAnswer {
                 question: "Why use symlinks?".to_string(),
                 answer: String::new(),
@@ -395,6 +410,7 @@ mod tests {
         );
 
         let parsed = parse_node_markdown(Path::new("qa.md"), &rendered).unwrap();
+        assert!(parsed.reviewed);
         assert_eq!(
             parsed.content,
             NodeContent::QuestionAnswer {
@@ -466,6 +482,22 @@ mod tests {
         assert_eq!(
             parse_node_markdown(Path::new("node.md"), &invalid_timestamp).unwrap_err(),
             "invalid unix timestamp `now`"
+        );
+
+        let invalid_reviewed = format!(
+            "---\nid: {id}\nkind: statement\ntitle: Bad reviewed\ncreated_at_unix: 1\nupdated_at_unix: 1\nreviewed: yes\n---\n\nBody"
+        );
+        assert_eq!(
+            parse_node_markdown(Path::new("node.md"), &invalid_reviewed).unwrap_err(),
+            "invalid boolean `yes`"
+        );
+
+        let missing_reviewed = format!(
+            "---\nid: {id}\nkind: statement\ntitle: Missing reviewed\ncreated_at_unix: 1\nupdated_at_unix: 1\n---\n\nBody"
+        );
+        assert_eq!(
+            parse_node_markdown(Path::new("node.md"), &missing_reviewed).unwrap_err(),
+            "missing metadata field `reviewed`"
         );
     }
 
