@@ -4,12 +4,14 @@
 
 Build small Rust libraries for storing and navigating an idea graph.
 
+Each graph can also store graph-level original idea context documents: editable Markdown records of the messy material that generated or later shaped the graph.
+
 The shared behavior is exposed through simple Rust functions for reading, adding, editing, linking, unlinking, deleting, and traversing nodes.
 
 Two storage crates are specified:
 
-- `focal-fs`: stores the graph as plain folders, Markdown files, and symbolic links.
-- `focal-sqlite`: stores the same graph model in SQLite through `rusqlite` instead of the filesystem.
+- `focal-fs`: stores the graph and original idea context as plain folders, Markdown files, and symbolic links.
+- `focal-sqlite`: stores the same graph model and original idea context in SQLite through `rusqlite` instead of the filesystem.
 
 A shared `focal-types` crate contains the common public data types used by both storage crates.
 
@@ -20,13 +22,18 @@ Each implementation should be understandable and usable from other Rust applicat
 ## 2. Goals
 
 - Store every idea node as Markdown content.
+- Store graph-level original idea context as editable Markdown documents.
+- Support multiple original idea context Markdown documents per graph.
 - Represent parent-child structure in the backend's native storage.
 - For `focal-fs`, keep each node in its own folder.
 - For `focal-fs`, keep each node's children in a dedicated child subfolder.
 - For `focal-fs`, use symlinks when a node has more than one parent.
+- For `focal-fs`, keep original idea context Markdown files in a dedicated top-level `context/` folder.
 - For `focal-sqlite`, store nodes, content, and edges in SQLite while preserving the same graph behavior as `focal-fs`.
+- For `focal-sqlite`, store original idea context documents in SQLite rows scoped to the graph namespace.
 - Provide a `focal-core` crate whose free-function API dispatches to `focal-fs` and, when the `sqlite` feature is enabled, `focal-sqlite` through a concrete `Backend` enum.
 - Support statement nodes and question-answer nodes.
+- Support creating, reading, updating, deleting, and listing graph-level original idea context documents.
 - Support graph navigation from any node.
 - Support listing ancestors and descendants.
 - Preserve stable node identity when titles or backend-specific storage locations change.
@@ -44,6 +51,8 @@ Each implementation should be understandable and usable from other Rust applicat
 - No automatic semantic analysis of ideas.
 - No support for arbitrary graph cycles in the first version.
 - No requirement for `focal-sqlite` to support manual filesystem edits, symlink repair, or arbitrary SQL access by callers.
+- No node-level provenance links from original idea context documents to generated nodes in the first version.
+- No version history or append-only audit log for original idea context document edits.
 
 ## 4. Terminology
 
@@ -51,6 +60,9 @@ Each implementation should be understandable and usable from other Rust applicat
 - **Unified backend**: The `focal-core::Backend` enum value used by callers that want the same API over either `focal-fs` or `focal-sqlite`.
 - **Graph root**: For `focal-fs`, the root directory containing the whole idea graph.
 - **SQLite graph**: For `focal-sqlite`, a named graph namespace stored in tables inside a shared SQLite database and opened through a borrowed `rusqlite::Connection`.
+- **Original idea context**: Messy graph-level Markdown material that helped generate or evolve the graph, stored separately from nodes.
+- **Context document**: One editable original idea context Markdown document. Context documents are graph-level records and are not linked to individual nodes in the first version.
+- **Context directory**: For `focal-fs`, the top-level `<graph-root>/context/` directory containing context Markdown files.
 - **Node**: One idea entry. A node is either a statement or a question-answer pair.
 - **Node directory**: For `focal-fs`, the directory that contains one node's `node.md` file and `children/` directory.
 - **Canonical node directory**: For `focal-fs`, the real directory that owns the node's Markdown and children.
@@ -73,6 +85,8 @@ The graph root uses this layout:
 
 ```text
 <graph-root>/
+  context/
+    <context-slug>--<context-id>.md
   roots/
     <slug>--<node-id>/
       node.md
@@ -83,9 +97,13 @@ The graph root uses this layout:
         <linked-child-slug>--<linked-child-id> -> ../../somewhere/<canonical-child-dir>
 ```
 
-Required directories:
+Required directory for graph recognition:
 
 - `<graph-root>/roots/`
+
+Managed directories:
+
+- `<graph-root>/context/`
 
 Required files:
 
@@ -99,13 +117,15 @@ Optional metadata directory:
 
 - `<graph-root>/.idea-graph/`
 
-No `VERSION` file is required in the first version. The `.idea-graph/` directory is reserved for optional metadata such as lock files, but a graph is identified by the presence of `roots/` and valid node directories.
+No `VERSION` file is required in the first version. The `.idea-graph/` directory is reserved for optional metadata such as lock files, but a graph is identified by the presence of `roots/`, valid node directories, and valid context Markdown files when any are present. `init_graph` must create `context/`, and `open_graph` must auto-create `context/` when it is missing from an otherwise valid graph root.
 
 Every real node directory must contain both `node.md` and `children/`.
 
 Every symlink node entry must point to a canonical node directory, not directly to `node.md`.
 
 The library must create relative symlinks where possible so a graph can be moved as a folder without breaking links.
+
+Every context document file must be a regular Markdown file under `context/` whose file name ends with `--<context-id>.md`.
 
 ## 6. `focal-fs` Node Directory Naming
 
@@ -132,10 +152,10 @@ why-rust-for-local-graphs--550e8400-e29b-41d4-a716-446655440000
 
 ## 7. Node IDs
 
-Node IDs must be:
+Node IDs and context document IDs must be:
 
-- Stable for the lifetime of a node.
-- Unique within a graph.
+- Stable for the lifetime of the node or context document.
+- Unique within their graph resource collection.
 - Safe for use in directory names and logical paths.
 - Independent of title and content.
 
@@ -160,6 +180,8 @@ a-f 0-9 -
 ```
 
 The library must reject IDs that are not valid UUID strings. It must also reject IDs containing path separators, `.` path components, control characters, or platform-reserved names.
+
+The library must generate UUID v4 IDs for new context documents using the same format and validation rules. Context document IDs are unique within the graph's context document collection and do not share an identity namespace with node IDs.
 
 ## 8. Markdown Format
 
@@ -229,6 +251,61 @@ For a question-answer node:
 - The answer is the Markdown content under `## Answer`.
 - The library must reject `qa` files missing either section.
 
+### Original Idea Context Markdown
+
+Original idea context is stored as graph-level Markdown documents. For `focal-fs`, each context document is stored as a Markdown file under `<graph-root>/context/`. For `focal-sqlite`, the same fields and Markdown body are stored in SQLite rows scoped to the graph namespace.
+
+Context documents are not nodes and do not have parents, children, canonical placements, aliases, or traversal behavior.
+
+For `focal-fs`, context file names use:
+
+```text
+<slug>--<context-id>.md
+```
+
+Rules:
+
+- The final `--<context-id>.md` suffix is authoritative.
+- The slug is for readability only.
+- The slug is generated from the title when a context document is created.
+- The slug may become stale after title edits.
+- If the slug and Markdown title metadata disagree, the Markdown title metadata wins.
+- If two generated file names would conflict, append `-2`, `-3`, and so on before the `--<context-id>.md` suffix.
+
+The file starts with the same simple line-oriented metadata block style as nodes.
+
+Required metadata fields:
+
+- `id`
+- `title`
+- `created_at_unix`
+- `updated_at_unix`
+
+Example:
+
+```markdown
+---
+id: 7a736f79-bf3f-4d1e-8bd8-71fd9b94a2d4
+title: Raw planning notes
+created_at_unix: 1777274800
+updated_at_unix: 1777274800
+---
+
+The initial prompt mixed feature ideas, unresolved questions, and examples.
+Keep it here so future graph changes can refer back to the original messy
+context without turning it into graph nodes immediately.
+```
+
+For a context document:
+
+- The body is the Markdown content after the metadata block.
+- The title lives in metadata only.
+- The library must not require, insert, remove, or manage a top-level `# Heading`.
+- The body may be empty.
+- The body may contain arbitrary Markdown.
+- The library should preserve body Markdown as much as possible when editing metadata only.
+- Context title edits update metadata but do not rename the filesystem file or SQLite logical filename.
+
 ## 9. Rust Data Model
 
 The public API should expose plain Rust types from a shared `focal-types` crate. `focal-fs` and `focal-sqlite` should use these shared types directly, and may re-export them for caller convenience.
@@ -239,6 +316,7 @@ Backend-specific graph handles and initialization functions live in their backen
 use std::path::PathBuf;
 
 pub type NodeId = String;
+pub type ContextId = String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
@@ -285,6 +363,37 @@ pub struct NodeSummary {
     pub canonical_path: PathBuf,
     pub is_alias: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDocument {
+    pub id: ContextId,
+    pub title: String,
+    pub filename: String,
+    pub markdown: String,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewContextDocument {
+    pub title: String,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextDocumentPatch {
+    pub title: Option<String>,
+    pub markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSummary {
+    pub id: ContextId,
+    pub title: String,
+    pub filename: String,
+    pub path: PathBuf,
+}
 ```
 
 The implementation may add private fields, but public types should stay small and easy to construct in tests.
@@ -292,6 +401,8 @@ The implementation may add private fields, but public types should stay small an
 For `focal-fs`, `canonical_path`, `alias_paths`, and `GraphEdge.path` are filesystem paths. For `focal-sqlite`, those fields are logical graph paths built from the same slug and node ID format, such as `roots/parent--<id>/children/child--<id>`. They identify the same canonical and alias placements but must not imply that files or directories exist on disk.
 
 For `focal-sqlite`, logical placement paths and slugs are stored when a placement is created. They must remain stable after title edits, matching the `focal-fs` behavior where directory slugs may become stale.
+
+For `focal-fs`, `ContextDocument.path` and `ContextSummary.path` are filesystem paths under `<graph-root>/context/`. For `focal-sqlite`, these fields are logical graph paths such as `context/raw-planning-notes--<context-id>.md`. The `filename` field is the final file-name component, including the `.md` extension. SQLite stores this logical filename when the context document is created and must not recalculate it after title edits.
 
 ## 10. Public API
 
@@ -309,6 +420,31 @@ pub struct IdeaGraph {
 pub fn init_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError>;
 
 pub fn open_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError>;
+
+pub fn add_context_document(
+    graph: &IdeaGraph,
+    context: NewContextDocument,
+) -> Result<ContextId, GraphError>;
+
+pub fn read_context_document(
+    graph: &IdeaGraph,
+    context_id: &str,
+) -> Result<ContextDocument, GraphError>;
+
+pub fn update_context_document(
+    graph: &IdeaGraph,
+    context_id: &str,
+    patch: ContextDocumentPatch,
+) -> Result<ContextDocument, GraphError>;
+
+pub fn delete_context_document(
+    graph: &IdeaGraph,
+    context_id: &str,
+) -> Result<(), GraphError>;
+
+pub fn list_context_documents(
+    graph: &IdeaGraph,
+) -> Result<Vec<ContextSummary>, GraphError>;
 
 pub fn add_root_node(
     graph: &IdeaGraph,
@@ -408,6 +544,31 @@ pub fn open_graph<'conn>(
     graph_name: &str,
 ) -> Result<IdeaGraph<'conn>, GraphError>;
 
+pub fn add_context_document(
+    graph: &mut IdeaGraph<'_>,
+    context: NewContextDocument,
+) -> Result<ContextId, GraphError>;
+
+pub fn read_context_document(
+    graph: &IdeaGraph<'_>,
+    context_id: &str,
+) -> Result<ContextDocument, GraphError>;
+
+pub fn update_context_document(
+    graph: &mut IdeaGraph<'_>,
+    context_id: &str,
+    patch: ContextDocumentPatch,
+) -> Result<ContextDocument, GraphError>;
+
+pub fn delete_context_document(
+    graph: &mut IdeaGraph<'_>,
+    context_id: &str,
+) -> Result<(), GraphError>;
+
+pub fn list_context_documents(
+    graph: &IdeaGraph<'_>,
+) -> Result<Vec<ContextSummary>, GraphError>;
+
 pub fn add_root_node(
     graph: &mut IdeaGraph<'_>,
     node: NewNode,
@@ -480,7 +641,7 @@ pub fn rebuild_index(
 ) -> Result<GraphIndex, GraphError>;
 ```
 
-The `focal-sqlite` graph handle mutably borrows the caller-provided connection and must not own or close it. Mutating operations take `&mut IdeaGraph`; read, list, traversal, and validation operations take `&IdeaGraph`.
+The `focal-sqlite` graph handle mutably borrows the caller-provided connection and must not own or close it. Mutating operations, including context document add, update, and delete operations, take `&mut IdeaGraph`; read, list, traversal, and validation operations take `&IdeaGraph`.
 
 `open_database` is a convenience helper for callers that want the crate to create a `rusqlite::Connection` from a database path. Callers may also construct and configure their own `rusqlite::Connection` and pass it to `init_graph` or `open_graph`.
 
@@ -550,6 +711,31 @@ pub fn open_sqlite<'conn>(
 pub fn disabled_sqlite(
     graph_name: impl Into<String>,
 ) -> Backend<'static>;
+
+pub fn add_context_document(
+    backend: &mut Backend<'_>,
+    context: NewContextDocument,
+) -> Result<ContextId, Error>;
+
+pub fn read_context_document(
+    backend: &Backend<'_>,
+    context_id: &str,
+) -> Result<ContextDocument, Error>;
+
+pub fn update_context_document(
+    backend: &mut Backend<'_>,
+    context_id: &str,
+    patch: ContextDocumentPatch,
+) -> Result<ContextDocument, Error>;
+
+pub fn delete_context_document(
+    backend: &mut Backend<'_>,
+    context_id: &str,
+) -> Result<(), Error>;
+
+pub fn list_context_documents(
+    backend: &Backend<'_>,
+) -> Result<Vec<ContextSummary>, Error>;
 
 pub fn add_root_node(
     backend: &mut Backend<'_>,
@@ -637,7 +823,7 @@ The `focal-core` implementation must follow functional Rust error handling:
 - Backend crates should expose public error types as `focal_fs::Error` and `focal_sqlite::Error`. These backend error types may differ.
 - `focal_core::Error` must preserve backend failures as typed variants: `Fs(focal_fs::Error)` for filesystem failures and, when the `sqlite` feature is enabled, `Sqlite(focal_sqlite::Error)` for SQLite failures.
 - `focal_core::Error` should implement `From<focal_fs::Error>` and, when the `sqlite` feature is enabled, `From<focal_sqlite::Error>`.
-- Missing nodes, parents, children, placements, canonical paths, or alias paths must be converted to the appropriate backend error and then into `focal_core::Error`.
+- Missing context documents, nodes, parents, children, placements, canonical paths, or alias paths must be converted to the appropriate backend error and then into `focal_core::Error`.
 - Internal `Option` values must be handled with `match`, `if let`, `let else`, or `ok_or_else`; public core code must not use `unwrap`, `expect`, unchecked indexing, `panic!`, `todo!`, or `unimplemented!` for recoverable states.
 - Backend errors must be propagated with `?` or converted explicitly without discarding path, node ID, or storage context.
 - The core crate must not silently ignore errors from either backend to keep the shared API behavior identical across `focal-fs` and `focal-sqlite`.
@@ -787,6 +973,21 @@ Markdown rewrite rules:
 - Existing content should be preserved where possible.
 - For statement nodes, preserve body Markdown.
 - For question-answer nodes, preserve question and answer Markdown except for the managed `## Question` and `## Answer` section headings.
+- For context documents, preserve body Markdown except for the managed metadata block.
+
+`update_context_document` must support:
+
+- Editing context document Markdown.
+- Editing a context document title.
+- Updating `updated_at_unix`.
+
+When a context document title changes:
+
+- Rewrite the title metadata field.
+- Do not rewrite a top-level `# Heading`.
+- Do not rename the filesystem file or SQLite logical filename.
+- Keep the context document ID unchanged.
+- Keep graph nodes and graph edges unchanged.
 
 ## 16. Add Semantics
 
@@ -805,6 +1006,15 @@ Adding a child node:
 - For `focal-fs`, creates a canonical node directory under `<parent-dir>/children/`, writes `node.md`, and creates `children/`.
 - Returns the generated node ID.
 
+Adding a context document:
+
+- Creates one graph-level original idea context document.
+- Generates a UUID v4 context document ID.
+- Stores context metadata and Markdown body.
+- For `focal-fs`, creates a Markdown file under `<graph-root>/context/`.
+- For `focal-sqlite`, inserts a context document row scoped to the graph namespace.
+- Returns the generated context document ID.
+
 Input validation:
 
 - Title must not be empty after trimming.
@@ -812,6 +1022,9 @@ Input validation:
 - Question text must not be empty after trimming.
 - Answer text may be empty if the caller wants to capture unanswered questions, but the `## Answer` section must exist.
 - Node ID must be unique.
+- Context document title must not be empty after trimming.
+- Context document Markdown body may be empty.
+- Context document ID must be unique within the graph's context document collection.
 
 ## 17. Read Semantics
 
@@ -831,6 +1044,28 @@ Input validation:
 - Include canonical root placements.
 - Include promoted roots.
 - Exclude broken symlinks unless returning a validation error.
+
+`read_context_document` must:
+
+- Locate a context document by ID in the graph-level context document collection.
+- Parse metadata.
+- Return the Markdown body exactly as stored apart from normal newline handling.
+- Return the filesystem path for `focal-fs` and a logical context path for `focal-sqlite`.
+- For `focal-fs`, return an error if multiple context Markdown files claim the same ID.
+
+`list_context_documents` must:
+
+- Return all graph-level context documents.
+- Sort deterministically by title, then context document ID.
+- For `focal-fs`, scan `<graph-root>/context/`.
+- For `focal-sqlite`, query context document rows scoped to the graph namespace.
+
+`delete_context_document` must:
+
+- Delete only the selected context document.
+- Leave all nodes, edges, placements, aliases, and traversal behavior unchanged.
+- For `focal-fs`, delete the matching Markdown file under `<graph-root>/context/`.
+- For `focal-sqlite`, delete the matching context document row scoped to the graph namespace.
 
 ## 18. Limited Movement and Promotion
 
@@ -854,7 +1089,7 @@ Promotion requirements:
 
 ## 19. Indexing and Discovery
 
-`focal-fs` must discover nodes by scanning the filesystem on demand.
+`focal-fs` must discover nodes and context documents by scanning the filesystem on demand.
 
 The first `focal-fs` version must not require an in-memory index or a persistent index for normal operation. `focal-sqlite` may use SQLite tables and indexes as its source of truth.
 
@@ -863,6 +1098,7 @@ The first `focal-fs` version must not require an in-memory index or a persistent
 ```rust
 #[derive(Debug, Clone)]
 pub struct GraphIndex {
+    pub contexts: Vec<ContextSummary>,
     pub nodes: Vec<NodeSummary>,
     pub edges: Vec<GraphEdge>,
     pub problems: Vec<GraphProblem>,
@@ -879,9 +1115,11 @@ pub struct GraphEdge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphProblem {
     BrokenSymlink { path: PathBuf },
+    DuplicateContextDocument { id: ContextId, paths: Vec<PathBuf> },
     DuplicateCanonicalNode { id: NodeId, paths: Vec<PathBuf> },
     MissingNodeMarkdown { path: PathBuf },
     MissingChildrenDirectory { path: PathBuf },
+    InvalidContextMarkdown { path: PathBuf, reason: String },
     InvalidMarkdown { path: PathBuf, reason: String },
     CycleDetected { node_id: NodeId },
 }
@@ -889,14 +1127,19 @@ pub enum GraphProblem {
 
 `focal-fs` scan rules:
 
+- Ensure `context/` exists before scanning by creating it if missing.
+- Scan `context/` for context Markdown files.
 - Scan `roots/` recursively.
+- Record context documents by context document ID.
 - Record real directories as canonical candidates.
 - Record symlink entries as edges to canonical targets.
 - Do not recursively descend into symlink entries after recording the edge.
 - Deduplicate by node ID.
+- Deduplicate context documents by context document ID.
+- Validate that every context document file has valid context metadata.
 - Validate that every real node directory has `node.md` and `children/`.
 
-For `focal-sqlite`, `rebuild_index` must query SQLite and return the same `GraphIndex` shape. `GraphEdge.path` must be a logical graph path, and `GraphEdge.is_symlink` must be `true` for alias placements and `false` for canonical placements.
+For `focal-sqlite`, `rebuild_index` must query SQLite and return the same `GraphIndex` shape. `ContextSummary.path` and `GraphEdge.path` must be logical graph paths, and `GraphEdge.is_symlink` must be `true` for alias placements and `false` for canonical placements.
 
 ## 20. Error Handling
 
@@ -908,12 +1151,16 @@ pub enum GraphError {
     Io(std::io::Error),
     Storage(String),
     InvalidGraphRoot(String),
+    ContextNotFound(String),
     NodeNotFound(String),
     ParentNotFound(String),
     ChildNotFound(String),
+    DuplicateContextId(String),
     DuplicateNodeId(String),
+    InvalidContextId(String),
     InvalidNodeId(String),
     InvalidTitle,
+    InvalidContextMarkdown { path: std::path::PathBuf, reason: String },
     InvalidMarkdown { path: std::path::PathBuf, reason: String },
     MissingNodeMarkdown(std::path::PathBuf),
     MissingChildrenDirectory(std::path::PathBuf),
@@ -924,6 +1171,7 @@ pub enum GraphError {
     WouldOrphanNode(String),
     PermissionDenied(std::path::PathBuf),
     AliasConflict(std::path::PathBuf),
+    DuplicateContextDocument { id: String, paths: Vec<std::path::PathBuf> },
     DuplicateCanonicalNode { id: String, paths: Vec<std::path::PathBuf> },
 }
 ```
@@ -943,6 +1191,7 @@ The implementation should provide `Display` and `std::error::Error` implementati
 Requirements:
 
 - Create directories before writing `node.md`.
+- Ensure the `context/` directory exists before writing or scanning context Markdown files.
 - Create symlinks only after the target node exists.
 - Do not require rollback for multi-step directory or symlink operations.
 - Do not require transactional guarantees for `focal-fs`.
@@ -995,6 +1244,8 @@ The library should expose a validation path through `rebuild_index`.
 `focal-fs` validation should detect:
 
 - Missing `roots/`.
+- Duplicate context document IDs.
+- Invalid context Markdown metadata.
 - Node directories without `node.md`.
 - Node directories without `children/`.
 - Invalid Markdown metadata.
@@ -1005,7 +1256,7 @@ The library should expose a validation path through `rebuild_index`.
 
 For `focal-fs`, symlink targets outside the graph root must be rejected by default.
 
-`focal-sqlite` validation should detect duplicate node IDs, invalid node content, missing edge endpoints, duplicate parent-child placements, multiple canonical placements for one node, cycles, and any stored logical path that does not match the node ID it claims to represent.
+`focal-sqlite` validation should detect duplicate context document IDs, invalid context document content, duplicate node IDs, invalid node content, missing edge endpoints, duplicate parent-child placements, multiple canonical placements for one node, cycles, and any stored logical path that does not match the context document ID or node ID it claims to represent.
 
 ## 25. Security and Safety
 
@@ -1018,6 +1269,7 @@ Requirements:
 - Never delete paths outside the graph root.
 - Canonicalize paths before destructive operations.
 - Validate that a delete target is inside the graph root.
+- Validate that context document deletes only remove Markdown files inside `<graph-root>/context/`.
 - Avoid shelling out to system commands.
 
 `focal-sqlite` must treat the configured SQLite graph namespace as the graph boundary. It must use parameterized SQL for caller-supplied values and must not shell out to system commands.
@@ -1030,6 +1282,8 @@ Initialization:
 
 - `init_graph` creates backend storage.
 - For `focal-fs`, `init_graph` creates `roots/`.
+- For `focal-fs`, `init_graph` creates `context/`.
+- For `focal-fs`, `open_graph` creates `context/` when it is missing from an otherwise valid graph root.
 - For `focal-fs`, `init_graph` does not require `.idea-graph/VERSION`.
 - For `focal-fs`, `open_graph` fails for a non-graph directory.
 - For `focal-sqlite`, `open_graph` fails when required graph tables, metadata, or the named graph namespace are missing.
@@ -1040,14 +1294,19 @@ Adding:
 - Add a root question-answer node.
 - Add a child statement node.
 - Add a child question-answer node.
+- Add multiple context documents.
 - Verify generated node IDs are UUID strings.
+- Verify generated context document IDs are UUID strings.
 - Reject empty titles.
+- Reject empty context document titles.
 - Reject empty questions for `qa` nodes.
 
 Reading:
 
 - Read a statement node from its ID.
 - Read a question-answer node from its ID.
+- Read a context document from its ID.
+- List context documents in deterministic order.
 - For `focal-fs`, read a node through a symlink parent and get the canonical content.
 - For `focal-sqlite`, read a node through an alias placement and get the canonical content.
 
@@ -1060,6 +1319,11 @@ Editing:
 - Verify title edits do not require a top-level `# Heading`.
 - Verify title edits do not rename the node directory or logical path.
 - Verify node ID remains stable across edits.
+- Update context document Markdown.
+- Update context document title.
+- Verify context title edits do not require a top-level `# Heading`.
+- Verify context title edits do not rename the context file or logical filename.
+- Verify context document ID remains stable across edits.
 
 Linking:
 
@@ -1084,6 +1348,7 @@ Unlinking:
 Deleting:
 
 - Delete a leaf node.
+- Delete a context document without changing nodes or edges.
 - Fail deleting a non-leaf with `FailIfHasChildren`.
 - Recursively delete a subtree.
 - Preserve shared descendants during recursive delete.
@@ -1102,16 +1367,20 @@ Traversal:
 Validation:
 
 - Detect duplicate IDs.
+- Detect duplicate context document IDs.
 - For `focal-fs`, detect broken symlinks.
+- For `focal-fs`, auto-create missing `context/` before validation scans it.
+- For `focal-fs`, detect malformed context Markdown metadata.
 - For `focal-fs`, detect missing `children/`.
 - For `focal-fs`, detect malformed `node.md`.
-- For `focal-sqlite`, detect missing edge endpoints, duplicate placements, and invalid stored node content.
+- For `focal-sqlite`, detect invalid stored context document content, missing edge endpoints, duplicate placements, and invalid stored node content.
 - Detect manual cycle and avoid infinite traversal.
 
 Safety:
 
 - For `focal-fs`, reject symlink targets outside graph root.
 - For `focal-fs`, never delete outside graph root.
+- For `focal-fs`, never delete context document paths outside `<graph-root>/context/`.
 - For `focal-sqlite`, use parameterized SQL for caller-supplied values.
 
 Unified core API:
@@ -1122,7 +1391,8 @@ Unified core API:
 - Verify mutating core functions dispatch correctly for both backend variants.
 - Verify read-only core functions dispatch correctly for both backend variants.
 - Verify backend-specific errors are propagated as typed `focal_core::Error` variants without being swallowed or collapsed into strings.
-- Verify missing nodes, parents, children, and placements are returned as errors, not panics or public `Option` values.
+- Verify context document operations dispatch correctly for both backend variants.
+- Verify missing context documents, nodes, parents, children, and placements are returned as errors, not panics or public `Option` values.
 - Verify public `focal-core` code paths do not use `unwrap`, `expect`, `panic!`, `todo!`, or `unimplemented!` for recoverable backend states.
 
 ## `focal-core` Unified API Crate
@@ -1141,6 +1411,7 @@ The crate should:
 - Provide filesystem constructor functions unconditionally.
 - Provide SQLite connection-based constructor functions only when the `sqlite` feature is enabled.
 - Provide the shared graph operation functions that take `&Backend<'_>` or `&mut Backend<'_>`.
+- Provide context document CRUD and list functions through the same backend dispatch model as node and traversal operations.
 - Dispatch each operation by matching the `Backend` variant and forwarding to the matching backend crate.
 - Preserve native backend errors as typed `focal_core::Error` variants.
 - Avoid exposing backend-specific branching to applications using the unified API.
@@ -1158,7 +1429,7 @@ The workspace should include a `focal-sqlite` crate, with Rust library name `foc
 
 `focal-sqlite` must not create or depend on `roots/`, `node.md`, `children/`, or symlink entries for normal operation. Filesystem paths exposed by shared public types are logical graph paths only.
 
-A single SQLite database may contain multiple named graph namespaces. Every graph metadata, node, placement, and edge query must be scoped to the selected graph namespace.
+A single SQLite database may contain multiple named graph namespaces. Every graph metadata, context document, node, placement, and edge query must be scoped to the selected graph namespace.
 
 Initialization:
 
@@ -1172,19 +1443,28 @@ Initialization:
 Storage requirements:
 
 - Store graph namespace metadata in SQLite.
+- Store context documents in SQLite with stable UUID context document IDs, filename, title, Markdown body, `created_at_unix`, and `updated_at_unix`.
 - Store nodes in SQLite with stable UUID node IDs, kind, title, Markdown content fields, `created_at_unix`, and `updated_at_unix`.
 - Store parent-child relationships in SQLite as placement rows scoped to the graph namespace.
+- Each `(graph_name, context_id)` context document must be unique.
+- Each `(graph_name, filename)` context document filename should be unique.
 - A root node has a canonical placement with no parent.
 - A child node has exactly one canonical placement and zero or more alias placements.
 - Each `(graph_name, parent_id, child_id)` edge must be unique.
 - Each node must have at most one canonical placement within a graph namespace.
-- Logical paths should use the same slug and `--<node-id>` naming convention as `focal-fs` so ordering, summaries, and diagnostics stay comparable.
+- Logical paths should use the same slug and `--<node-id>` or `--<context-id>.md` naming conventions as `focal-fs` so ordering, summaries, and diagnostics stay comparable.
+- Each context document should store its logical filename and slug at creation time. Title edits must not recalculate or rename stored logical filenames.
 - Each placement should store its logical path and slug at creation time. Title edits must not recalculate or rename stored logical paths.
 
 Behavioral requirements:
 
 - Public operations after initialization must match `focal-fs` semantics unless this section explicitly says otherwise.
 - Mutating operations should take `&mut IdeaGraph`; read, list, traversal, and validation operations should take `&IdeaGraph`.
+- `add_context_document` inserts a context document row scoped to the selected graph namespace instead of creating a Markdown file.
+- `read_context_document` returns the Markdown body and logical context path from the context document row.
+- `update_context_document` updates the title, Markdown body, and `updated_at_unix` while preserving the context document ID and logical filename.
+- `delete_context_document` deletes only the selected context document row and must not alter nodes, placements, or edges.
+- `list_context_documents` returns context summaries in deterministic order.
 - `add_root_node` and `add_child_node` insert node and placement rows scoped to the selected graph namespace instead of creating directories and Markdown files.
 - `read_node` returns node content from the canonical node row, with logical canonical and alias paths.
 - `link_existing_node` creates an alias placement row when the edge does not already exist, except when linking a root node with no other parents under a parent; in that case it moves the root's canonical placement under the new parent to match `focal-fs`.
@@ -1197,13 +1477,13 @@ Behavioral requirements:
 Consistency requirements:
 
 - Mutations that insert, delete, or promote multiple rows should run as one SQLite transaction.
-- The schema should use database constraints for graph namespace uniqueness, node ID uniqueness within a namespace, edge uniqueness, and canonical placement uniqueness where SQLite supports them.
+- The schema should use database constraints for graph namespace uniqueness, context document ID uniqueness within a namespace, context filename uniqueness within a namespace, node ID uniqueness within a namespace, edge uniqueness, and canonical placement uniqueness where SQLite supports them.
 - The crate should be safe to use with multiple readers and should document the write consistency guarantees it relies on from SQLite and `rusqlite`.
 
 Testing requirements:
 
 - The shared public API behavior tests should run against `focal-sqlite` with SQLite-backed storage.
-- Tests should cover SQLite schema initialization, opening an existing SQLite graph namespace, alias placement creation, promotion, recursive delete with shared descendants, traversal determinism, validation, and storage errors.
+- Tests should cover SQLite schema initialization, opening an existing SQLite graph namespace, context document CRUD and listing, alias placement creation, promotion, recursive delete with shared descendants, traversal determinism, validation, and storage errors.
 
 ## Spec Test Traceability
 
@@ -1245,6 +1525,14 @@ Each row points to at least one `focal-fs` in-crate unit test and one public API
 ```rust
 let graph = init_graph("./ideas")?;
 
+let context_id = add_context_document(
+    &graph,
+    NewContextDocument {
+        title: "Raw planning notes".to_string(),
+        markdown: "A messy prompt, unresolved questions, and examples.".to_string(),
+    },
+)?;
+
 let rust_id = add_root_node(
     &graph,
     NewNode {
@@ -1278,6 +1566,9 @@ let descendants = list_descendants(
 )?;
 
 assert_eq!(descendants[0].id, qa_id);
+
+let contexts = list_context_documents(&graph)?;
+assert_eq!(contexts[0].id, context_id);
 ```
 
 ## 28. Acceptance Criteria
@@ -1286,20 +1577,28 @@ The shared graph behavior is acceptable when:
 
 - A graph can be initialized in empty backend storage.
 - For `focal-fs`, a graph can be initialized in an empty directory.
+- For `focal-fs`, graph initialization creates top-level `roots/` and `context/` directories.
+- For `focal-fs`, opening an otherwise valid graph root auto-creates a missing top-level `context/` directory.
 - For `focal-fs`, no `.idea-graph/VERSION` file is required.
+- Multiple original idea context Markdown documents can be added, read, updated, listed, and deleted.
 - Statement and question-answer nodes can be added, read, updated, and deleted.
 - Generated node IDs are UUID strings.
+- Generated context document IDs are UUID strings.
+- Context documents are graph-level only and are not linked to individual nodes.
+- Context document title edits do not rename filesystem files or SQLite logical filenames.
+- For `focal-fs`, context documents live under `<graph-root>/context/` as Markdown files.
 - For `focal-fs`, every node is represented by a directory containing `node.md` and `children/`.
 - For `focal-fs`, root nodes live under `roots/`.
 - For `focal-fs`, child nodes live under a parent's `children/`.
 - For `focal-fs`, shared children are represented with symlink entries.
 - For `focal-sqlite`, nodes and placements are stored in SQLite instead of the filesystem.
+- For `focal-sqlite`, context documents are stored in rows scoped to the graph namespace.
 - For `focal-sqlite`, shared children are represented with alias placement rows.
 - `focal-core` exposes a concrete `Backend` enum with filesystem and SQLite variants.
 - `focal-core` always includes filesystem support and gates SQLite support behind a `sqlite` Cargo feature.
 - `focal-core` keeps `Backend::Sqlite` present when the `sqlite` feature is disabled by using an empty SQLite placeholder that returns disabled-SQLite errors for graph operations.
 - `focal-core` exposes the shared graph operations as plain free functions that take `Backend`.
-- Applications can add, read, edit, link, unlink, delete, list, traverse, and validate through `focal-core` without backend-specific dispatch code.
+- Applications can add, read, edit, link, unlink, delete, list, traverse, validate, and manage context documents through `focal-core` without backend-specific dispatch code.
 - `focal-core` handles missing values and backend failures with `Result<T, focal_core::Error>` instead of panics or public `Option` return values.
 - `focal_core::Error` preserves backend failures as typed variants for `focal_fs::Error` and, when enabled, `focal_sqlite::Error`.
 - Canonical node promotion works when deleting or unlinking canonical parents with remaining aliases.
