@@ -79,6 +79,16 @@ CREATE TABLE IF NOT EXISTS focal_nodes (
     FOREIGN KEY (graph_id) REFERENCES focal_graphs(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS focal_qa_alternative_answers (
+    graph_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    answer_order INTEGER NOT NULL,
+    answer TEXT NOT NULL,
+    PRIMARY KEY (graph_id, node_id, answer_order),
+    FOREIGN KEY (graph_id) REFERENCES focal_graphs(id) ON DELETE CASCADE,
+    FOREIGN KEY (graph_id, node_id) REFERENCES focal_nodes(graph_id, id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS focal_context_documents (
     graph_id INTEGER NOT NULL,
     id TEXT NOT NULL,
@@ -697,6 +707,13 @@ struct RawNode {
 }
 
 #[derive(Debug)]
+struct RawAlternativeAnswer {
+    node_id: String,
+    answer_order: i64,
+    answer: String,
+}
+
+#[derive(Debug)]
 struct RawContext {
     id: String,
     slug: String,
@@ -720,6 +737,7 @@ struct RawPlacement {
 fn load_scan(connection: &Connection, graph_id: i64) -> Result<ScanResult, GraphError> {
     let context_scan = load_context_scan(connection, graph_id)?;
     let raw_nodes = query_raw_nodes(connection, graph_id)?;
+    let raw_alternative_answers = query_raw_alternative_answers(connection, graph_id)?;
     let raw_placements = query_raw_placements(connection, graph_id)?;
     let raw_node_ids = raw_nodes
         .iter()
@@ -733,6 +751,12 @@ fn load_scan(connection: &Connection, graph_id: i64) -> Result<ScanResult, Graph
         problems: context_scan.problems,
         node_problems: BTreeMap::new(),
     };
+    let alternative_answers_by_node = group_alternative_answers(
+        &mut result,
+        raw_alternative_answers,
+        &raw_node_ids,
+        &raw_placements,
+    );
 
     let mut seen_nodes = BTreeSet::new();
     for raw_node in raw_nodes {
@@ -749,7 +773,11 @@ fn load_scan(connection: &Connection, graph_id: i64) -> Result<ScanResult, Graph
             continue;
         }
 
-        match scanned_node_from_raw(raw_node, &path) {
+        let alternative_answers = alternative_answers_by_node
+            .get(&raw_node.id)
+            .cloned()
+            .unwrap_or_default();
+        match scanned_node_from_raw(raw_node, alternative_answers, &path) {
             Ok(node) => {
                 result.nodes.insert(node.id.clone(), node);
             }
@@ -869,6 +897,94 @@ fn load_context_scan(connection: &Connection, graph_id: i64) -> Result<ContextSc
     Ok(result)
 }
 
+fn group_alternative_answers(
+    result: &mut ScanResult,
+    raw_answers: Vec<RawAlternativeAnswer>,
+    raw_node_ids: &BTreeSet<String>,
+    raw_placements: &[RawPlacement],
+) -> BTreeMap<String, Vec<String>> {
+    let mut answers_by_node = BTreeMap::<String, Vec<(i64, String)>>::new();
+    let mut seen_orders = BTreeSet::<(String, i64)>::new();
+
+    for raw in raw_answers {
+        let path = diagnostic_path_for_node(raw_placements, &raw.node_id);
+        if let Err(error) = validate_node_id(&raw.node_id) {
+            add_node_problem(
+                result,
+                &raw.node_id,
+                GraphProblem::InvalidMarkdown {
+                    path,
+                    reason: error.to_string(),
+                },
+            );
+            continue;
+        }
+        if !raw_node_ids.contains(&raw.node_id) {
+            add_node_problem(
+                result,
+                &raw.node_id,
+                GraphProblem::InvalidMarkdown {
+                    path,
+                    reason: "alternative answer references missing node".to_string(),
+                },
+            );
+            continue;
+        }
+        if raw.answer_order < 0 {
+            add_node_problem(
+                result,
+                &raw.node_id,
+                GraphProblem::InvalidMarkdown {
+                    path,
+                    reason: format!("invalid alternative answer order `{}`", raw.answer_order),
+                },
+            );
+            continue;
+        }
+        if !seen_orders.insert((raw.node_id.clone(), raw.answer_order)) {
+            add_node_problem(
+                result,
+                &raw.node_id,
+                GraphProblem::InvalidMarkdown {
+                    path,
+                    reason: format!("duplicate alternative answer order `{}`", raw.answer_order),
+                },
+            );
+            continue;
+        }
+        if raw.answer.trim().is_empty() {
+            add_node_problem(
+                result,
+                &raw.node_id,
+                GraphProblem::InvalidMarkdown {
+                    path,
+                    reason: "alternative answer must not be empty".to_string(),
+                },
+            );
+            continue;
+        }
+
+        answers_by_node
+            .entry(raw.node_id)
+            .or_default()
+            .push((raw.answer_order, raw.answer));
+    }
+
+    answers_by_node
+        .into_iter()
+        .map(|(node_id, mut answers)| {
+            answers.sort_by_key(|(answer_order, _)| *answer_order);
+            (
+                node_id,
+                answers
+                    .into_iter()
+                    .map(|(_, answer)| answer)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
 fn scanned_context_from_raw(
     raw_context: RawContext,
 ) -> Result<ScannedContext, (String, GraphProblem)> {
@@ -924,6 +1040,7 @@ fn scanned_context_from_raw(
 
 fn scanned_node_from_raw(
     raw_node: RawNode,
+    alternative_answers: Vec<String>,
     path: &Path,
 ) -> Result<ScannedNode, (String, GraphProblem)> {
     let id = raw_node.id;
@@ -967,8 +1084,9 @@ fn scanned_node_from_raw(
             raw_node.statement_body,
             raw_node.qa_question,
             raw_node.qa_answer,
+            alternative_answers.is_empty(),
         ) {
-            (Some(body), None, None) => NodeContent::Statement { body },
+            (Some(body), None, None, true) => NodeContent::Statement { body },
             _ => {
                 return Err((
                     id,
@@ -985,7 +1103,11 @@ fn scanned_node_from_raw(
             raw_node.qa_answer,
         ) {
             (None, Some(question), Some(answer)) if !question.trim().is_empty() => {
-                NodeContent::QuestionAnswer { question, answer }
+                NodeContent::QuestionAnswer {
+                    question,
+                    answer,
+                    alternative_answers,
+                }
             }
             (None, Some(_), Some(_)) => {
                 return Err((
@@ -1129,6 +1251,34 @@ fn query_raw_nodes(connection: &Connection, graph_id: i64) -> Result<Vec<RawNode
         nodes.push(row.map_err(storage_error)?);
     }
     Ok(nodes)
+}
+
+fn query_raw_alternative_answers(
+    connection: &Connection,
+    graph_id: i64,
+) -> Result<Vec<RawAlternativeAnswer>, GraphError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT node_id, answer_order, answer \
+             FROM focal_qa_alternative_answers \
+             WHERE graph_id = ?1 \
+             ORDER BY node_id, answer_order",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map(params![graph_id], |row| {
+            Ok(RawAlternativeAnswer {
+                node_id: row.get(0)?,
+                answer_order: row.get(1)?,
+                answer: row.get(2)?,
+            })
+        })
+        .map_err(storage_error)?;
+    let mut answers = Vec::new();
+    for row in rows {
+        answers.push(row.map_err(storage_error)?);
+    }
+    Ok(answers)
 }
 
 fn query_raw_contexts(
@@ -1275,6 +1425,7 @@ fn ensure_schema_exists(connection: &Connection) -> Result<(), GraphError> {
         "focal_graphs",
         "focal_nodes",
         "focal_context_documents",
+        "focal_qa_alternative_answers",
         "focal_placements",
     ] {
         let exists = connection
@@ -1314,6 +1465,11 @@ fn ensure_schema_exists(connection: &Connection) -> Result<(), GraphError> {
     )?;
     ensure_table_columns(
         connection,
+        "focal_qa_alternative_answers",
+        &["graph_id", "node_id", "answer_order", "answer"],
+    )?;
+    ensure_table_columns(
+        connection,
         "focal_context_documents",
         &[
             "graph_id",
@@ -1341,6 +1497,11 @@ fn ensure_schema_exists(connection: &Connection) -> Result<(), GraphError> {
     )?;
     ensure_table_primary_key(connection, "focal_graphs", &["id"])?;
     ensure_table_primary_key(connection, "focal_nodes", &["graph_id", "id"])?;
+    ensure_table_primary_key(
+        connection,
+        "focal_qa_alternative_answers",
+        &["graph_id", "node_id", "answer_order"],
+    )?;
     ensure_table_primary_key(connection, "focal_context_documents", &["graph_id", "id"])?;
     ensure_table_primary_key(connection, "focal_placements", &["id"])?;
     ensure_unique_key(connection, "focal_graphs", &["name"])?;
@@ -1498,6 +1659,7 @@ fn insert_node(
             ],
         )
         .map_err(storage_error)?;
+    insert_alternative_answers(connection, graph_id, id, &node.content)?;
     Ok(())
 }
 
@@ -1530,6 +1692,7 @@ fn update_node_row(
     if rows == 0 {
         return Err(GraphError::NodeNotFound(node_id.to_string()));
     }
+    replace_alternative_answers(connection, graph_id, node_id, content)?;
     Ok(())
 }
 
@@ -1618,6 +1781,48 @@ fn insert_placement(
     Ok(())
 }
 
+fn replace_alternative_answers(
+    connection: &Connection,
+    graph_id: i64,
+    node_id: &str,
+    content: &NodeContent,
+) -> Result<(), GraphError> {
+    connection
+        .execute(
+            "DELETE FROM focal_qa_alternative_answers WHERE graph_id = ?1 AND node_id = ?2",
+            params![graph_id, node_id],
+        )
+        .map_err(storage_error)?;
+    insert_alternative_answers(connection, graph_id, node_id, content)
+}
+
+fn insert_alternative_answers(
+    connection: &Connection,
+    graph_id: i64,
+    node_id: &str,
+    content: &NodeContent,
+) -> Result<(), GraphError> {
+    let NodeContent::QuestionAnswer {
+        alternative_answers,
+        ..
+    } = content
+    else {
+        return Ok(());
+    };
+
+    for (index, answer) in alternative_answers.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO focal_qa_alternative_answers \
+                 (graph_id, node_id, answer_order, answer) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![graph_id, node_id, usize_to_i64(index)?, answer],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
 fn delete_placement(connection: &Connection, graph_id: i64, row_id: i64) -> Result<(), GraphError> {
     connection
         .execute(
@@ -1631,18 +1836,18 @@ fn delete_placement(connection: &Connection, graph_id: i64, row_id: i64) -> Resu
 fn node_fields(node: &NewNode) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
     match &node.content {
         NodeContent::Statement { body } => ("statement", Some(body.as_str()), None, None),
-        NodeContent::QuestionAnswer { question, answer } => {
-            ("qa", None, Some(question.as_str()), Some(answer.as_str()))
-        }
+        NodeContent::QuestionAnswer {
+            question, answer, ..
+        } => ("qa", None, Some(question.as_str()), Some(answer.as_str())),
     }
 }
 
 fn content_fields(content: &NodeContent) -> (Option<&str>, Option<&str>, Option<&str>) {
     match content {
         NodeContent::Statement { body } => (Some(body.as_str()), None, None),
-        NodeContent::QuestionAnswer { question, answer } => {
-            (None, Some(question.as_str()), Some(answer.as_str()))
-        }
+        NodeContent::QuestionAnswer {
+            question, answer, ..
+        } => (None, Some(question.as_str()), Some(answer.as_str())),
     }
 }
 
@@ -2510,6 +2715,18 @@ fn validate_content_values(content: &NodeContent, path: &Path) -> Result<(), Gra
                 reason: "question must not be empty".to_string(),
             })
         }
+        NodeContent::QuestionAnswer {
+            alternative_answers,
+            ..
+        } if alternative_answers
+            .iter()
+            .any(|answer| answer.trim().is_empty()) =>
+        {
+            Err(GraphError::InvalidMarkdown {
+                path: path.to_path_buf(),
+                reason: "alternative answer must not be empty".to_string(),
+            })
+        }
         NodeContent::QuestionAnswer { .. } => Ok(()),
     }
 }
@@ -2620,6 +2837,11 @@ fn unix_to_i64(value: u64) -> Result<i64, GraphError> {
     i64::try_from(value).map_err(|_| {
         GraphError::Storage("unix timestamp does not fit in SQLite INTEGER".to_string())
     })
+}
+
+fn usize_to_i64(value: usize) -> Result<i64, GraphError> {
+    i64::try_from(value)
+        .map_err(|_| GraphError::Storage("answer order does not fit in SQLite INTEGER".to_string()))
 }
 
 fn now_unix() -> u64 {

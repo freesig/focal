@@ -39,8 +39,12 @@ pub(crate) fn parse_node_markdown(path: &Path, source: &str) -> Result<ParsedMar
             body: body.to_string(),
         },
         NodeKind::QuestionAnswer => {
-            let (question, answer) = parse_question_answer(path, body)?;
-            NodeContent::QuestionAnswer { question, answer }
+            let (question, answer, alternative_answers) = parse_question_answer(path, body)?;
+            NodeContent::QuestionAnswer {
+                question,
+                answer,
+                alternative_answers,
+            }
         }
     };
 
@@ -84,11 +88,17 @@ pub(crate) fn render_node_markdown(
     };
     let body = match content {
         NodeContent::Statement { body } => body.clone(),
-        NodeContent::QuestionAnswer { question, answer } => {
+        NodeContent::QuestionAnswer {
+            question,
+            answer,
+            alternative_answers,
+        } => {
+            let rendered_alternatives = render_alternative_answers(alternative_answers);
             format!(
-                "## Question\n\n{}\n\n## Answer\n\n{}",
+                "## Question\n\n{}\n\n## Answer\n\n{}\n\n## Alternative answers\n\n{}",
                 trim_trailing_line_endings(question),
-                trim_trailing_line_endings(answer)
+                trim_trailing_line_endings(answer),
+                rendered_alternatives
             )
         }
     };
@@ -175,23 +185,112 @@ fn parse_unix(value: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid unix timestamp `{value}`"))
 }
 
-fn parse_question_answer(path: &Path, body: &str) -> Result<(String, String), String> {
+fn parse_question_answer(path: &Path, body: &str) -> Result<(String, String, Vec<String>), String> {
     let question = find_heading(body, "## Question", 0)
         .ok_or_else(|| format!("{} is missing `## Question`", path.display()))?;
     let answer = find_heading(body, "## Answer", question.content_start)
         .ok_or_else(|| format!("{} is missing `## Answer`", path.display()))?;
+    let alternatives = find_heading(body, "## Alternative answers", answer.content_start)
+        .ok_or_else(|| format!("{} is missing `## Alternative answers`", path.display()))?;
 
     if answer.heading_start < question.content_start {
         return Err("`## Answer` appears before `## Question`".to_string());
     }
+    if alternatives.heading_start < answer.content_start {
+        return Err("`## Alternative answers` appears before `## Answer`".to_string());
+    }
 
     let question_text = normalize_section(&body[question.content_start..answer.heading_start]);
-    let answer_text = normalize_section(&body[answer.content_start..]);
+    let answer_text = normalize_section(&body[answer.content_start..alternatives.heading_start]);
+    let alternative_answers = parse_alternative_answers(&body[alternatives.content_start..])?;
     if question_text.trim().is_empty() {
         return Err("question must not be empty".to_string());
     }
 
-    Ok((question_text, answer_text))
+    Ok((question_text, answer_text, alternative_answers))
+}
+
+fn parse_alternative_answers(section: &str) -> Result<Vec<String>, String> {
+    let section = normalize_section(section);
+    let mut answers = Vec::new();
+    let mut current_answer = None::<String>;
+    for line in section.split_inclusive('\n') {
+        let line = strip_line_ending(line);
+        if line.trim().is_empty() {
+            if let Some(answer) = current_answer.as_mut() {
+                answer.push('\n');
+            }
+            continue;
+        }
+
+        if let Some(answer) = line.strip_prefix("- ") {
+            finish_alternative_answer(&mut answers, current_answer.take())?;
+            current_answer = Some(answer.to_string());
+            continue;
+        }
+
+        if line.starts_with(' ') || line.starts_with('\t') {
+            let Some(answer) = current_answer.as_mut() else {
+                return Err(
+                    "alternative answers must be top-level Markdown list items using `- `"
+                        .to_string(),
+                );
+            };
+            if !answer.is_empty() {
+                answer.push('\n');
+            }
+            answer.push_str(strip_list_continuation_indent(line));
+            continue;
+        }
+
+        return Err(
+            "alternative answers must be top-level Markdown list items using `- `".to_string(),
+        );
+    }
+
+    finish_alternative_answer(&mut answers, current_answer)?;
+    Ok(answers)
+}
+
+fn finish_alternative_answer(
+    answers: &mut Vec<String>,
+    answer: Option<String>,
+) -> Result<(), String> {
+    if let Some(answer) = answer {
+        let answer = trim_trailing_line_endings(&answer).to_string();
+        if answer.trim().is_empty() {
+            return Err("alternative answer must not be empty".to_string());
+        }
+        answers.push(answer);
+    }
+
+    Ok(())
+}
+
+fn strip_list_continuation_indent(line: &str) -> &str {
+    line.strip_prefix("  ")
+        .or_else(|| line.strip_prefix('\t'))
+        .or_else(|| line.strip_prefix(' '))
+        .unwrap_or(line)
+}
+
+fn render_alternative_answers(answers: &[String]) -> String {
+    answers
+        .iter()
+        .map(|answer| {
+            let answer = trim_trailing_line_endings(answer);
+            let mut lines = answer.split('\n');
+            let first_line = lines.next().unwrap_or_default();
+            let mut rendered = format!("- {}", strip_line_ending(first_line));
+            for line in lines {
+                rendered.push('\n');
+                rendered.push_str("  ");
+                rendered.push_str(strip_line_ending(line));
+            }
+            rendered
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -288,6 +387,10 @@ mod tests {
             &NodeContent::QuestionAnswer {
                 question: "Why use symlinks?".to_string(),
                 answer: String::new(),
+                alternative_answers: vec![
+                    "They preserve one canonical Markdown file.".to_string(),
+                    "They keep shared children visible.".to_string(),
+                ],
             },
         );
 
@@ -297,8 +400,15 @@ mod tests {
             NodeContent::QuestionAnswer {
                 question: "Why use symlinks?".to_string(),
                 answer: String::new(),
+                alternative_answers: vec![
+                    "They preserve one canonical Markdown file.".to_string(),
+                    "They keep shared children visible.".to_string(),
+                ],
             }
         );
+        assert!(rendered.contains(
+            "## Alternative answers\n\n- They preserve one canonical Markdown file.\n- They keep shared children visible."
+        ));
 
         let missing_answer = format!(
             "{}## Question\n\nWhy?",
@@ -310,13 +420,32 @@ mod tests {
                 .contains("missing `## Answer`")
         );
 
+        let missing_alternatives = format!(
+            "{}## Question\n\nWhy?\n\n## Answer\n\nLater",
+            metadata(id, "qa", "Missing alternatives")
+        );
+        assert!(
+            parse_node_markdown(Path::new("qa.md"), &missing_alternatives)
+                .unwrap_err()
+                .contains("missing `## Alternative answers`")
+        );
+
         let empty_question = format!(
-            "{}## Question\n\n\n## Answer\n\nLater",
+            "{}## Question\n\n\n## Answer\n\nLater\n\n## Alternative answers\n\n",
             metadata(id, "qa", "Empty")
         );
         assert_eq!(
             parse_node_markdown(Path::new("qa.md"), &empty_question).unwrap_err(),
             "question must not be empty"
+        );
+
+        let invalid_alternatives = format!(
+            "{}## Question\n\nWhy?\n\n## Answer\n\nLater\n\n## Alternative answers\n\nMaybe",
+            metadata(id, "qa", "Bad alternatives")
+        );
+        assert_eq!(
+            parse_node_markdown(Path::new("qa.md"), &invalid_alternatives).unwrap_err(),
+            "alternative answers must be top-level Markdown list items using `- `"
         );
     }
 

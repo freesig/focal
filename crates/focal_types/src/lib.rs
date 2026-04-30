@@ -25,8 +25,14 @@ pub struct Node {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeContent {
-    Statement { body: String },
-    QuestionAnswer { question: String, answer: String },
+    Statement {
+        body: String,
+    },
+    QuestionAnswer {
+        question: String,
+        answer: String,
+        alternative_answers: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +195,11 @@ mod tests {
     #[test]
     fn context_models_are_plain_constructible_values() {
         let id: ContextId = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let qa_content = NodeContent::QuestionAnswer {
+            question: "Why?".to_string(),
+            answer: "Because.".to_string(),
+            alternative_answers: vec!["Maybe.".to_string()],
+        };
         let document = ContextDocument {
             id: id.clone(),
             title: "Raw notes".to_string(),
@@ -206,6 +217,14 @@ mod tests {
         };
 
         assert_eq!(document.id, id);
+        assert_eq!(
+            qa_content,
+            NodeContent::QuestionAnswer {
+                question: "Why?".to_string(),
+                answer: "Because.".to_string(),
+                alternative_answers: vec!["Maybe.".to_string()],
+            }
+        );
         assert_eq!(summary.filename, document.filename);
         assert_eq!(
             NewContextDocument {

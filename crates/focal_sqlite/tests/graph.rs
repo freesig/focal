@@ -26,6 +26,7 @@ fn qa(title: &str, question: &str, answer: &str) -> NewNode {
         content: NodeContent::QuestionAnswer {
             question: question.to_string(),
             answer: answer.to_string(),
+            alternative_answers: Vec::new(),
         },
     }
 }
@@ -176,6 +177,13 @@ fn open_graph_rejects_context_schema_without_required_constraints() {
                 updated_at_unix INTEGER NOT NULL,
                 UNIQUE (graph_id, filename)
             );
+            CREATE TABLE focal_qa_alternative_answers (
+                graph_id INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                answer_order INTEGER NOT NULL,
+                answer TEXT NOT NULL,
+                PRIMARY KEY (graph_id, node_id, answer_order)
+            );
             CREATE TABLE focal_placements (
                 id INTEGER PRIMARY KEY,
                 graph_id INTEGER NOT NULL,
@@ -228,6 +236,13 @@ fn open_graph_rejects_context_schema_without_required_constraints() {
                 created_at_unix INTEGER NOT NULL,
                 updated_at_unix INTEGER NOT NULL,
                 PRIMARY KEY (graph_id, id)
+            );
+            CREATE TABLE focal_qa_alternative_answers (
+                graph_id INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                answer_order INTEGER NOT NULL,
+                answer TEXT NOT NULL,
+                PRIMARY KEY (graph_id, node_id, answer_order)
             );
             CREATE TABLE focal_placements (
                 id INTEGER PRIMARY KEY,
@@ -458,6 +473,7 @@ fn add_read_update_and_path_stability() {
         NodeContent::QuestionAnswer {
             question: "Why SQLite?".to_string(),
             answer: String::new(),
+            alternative_answers: Vec::new(),
         }
     );
 
@@ -500,6 +516,7 @@ fn root_question_answer_nodes_update_without_path_changes() {
         NodeContent::QuestionAnswer {
             question: "What is stored?".to_string(),
             answer: String::new(),
+            alternative_answers: Vec::new(),
         }
     );
     assert_eq!(list_roots(&graph).unwrap()[0].id, root);
@@ -512,6 +529,10 @@ fn root_question_answer_nodes_update_without_path_changes() {
             content: Some(NodeContent::QuestionAnswer {
                 question: "What changed?".to_string(),
                 answer: "The row content changed.".to_string(),
+                alternative_answers: vec![
+                    "The alternatives changed too.".to_string(),
+                    "The original alternatives were replaced.".to_string(),
+                ],
             }),
         },
     )
@@ -527,9 +548,88 @@ fn root_question_answer_nodes_update_without_path_changes() {
         NodeContent::QuestionAnswer {
             question: "What changed?".to_string(),
             answer: "The row content changed.".to_string(),
+            alternative_answers: vec![
+                "The alternatives changed too.".to_string(),
+                "The original alternatives were replaced.".to_string(),
+            ],
         }
     );
     assert_eq!(list_roots(&graph).unwrap()[0].title, "Updated title");
+}
+
+#[test]
+fn question_answer_alternative_answers_round_trip_in_order_and_replace_on_update() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut graph = init_graph(&mut connection, "main").unwrap();
+    let root = add_root_node(
+        &mut graph,
+        NewNode {
+            kind: NodeKind::QuestionAnswer,
+            title: "Alternatives".to_string(),
+            content: NodeContent::QuestionAnswer {
+                question: "Which answer is most likely?".to_string(),
+                answer: "The primary answer.".to_string(),
+                alternative_answers: vec![
+                    "The next most likely answer.".to_string(),
+                    "A less likely answer.".to_string(),
+                ],
+            },
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_node(&graph, &root).unwrap().content,
+        NodeContent::QuestionAnswer {
+            question: "Which answer is most likely?".to_string(),
+            answer: "The primary answer.".to_string(),
+            alternative_answers: vec![
+                "The next most likely answer.".to_string(),
+                "A less likely answer.".to_string(),
+            ],
+        }
+    );
+
+    let updated = update_node(
+        &mut graph,
+        &root,
+        NodePatch {
+            title: None,
+            content: Some(NodeContent::QuestionAnswer {
+                question: "Which answer is most likely now?".to_string(),
+                answer: "The revised primary answer.".to_string(),
+                alternative_answers: vec!["The replacement alternative.".to_string()],
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        updated.content,
+        NodeContent::QuestionAnswer {
+            question: "Which answer is most likely now?".to_string(),
+            answer: "The revised primary answer.".to_string(),
+            alternative_answers: vec!["The replacement alternative.".to_string()],
+        }
+    );
+
+    drop(graph);
+    let graph = graph_id(&connection, "main");
+    let stored = connection
+        .prepare(
+            "SELECT answer_order, answer FROM focal_qa_alternative_answers \
+             WHERE graph_id = ?1 AND node_id = ?2 ORDER BY answer_order",
+        )
+        .unwrap()
+        .query_map(params![graph, root], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        stored,
+        vec![(0, "The replacement alternative.".to_string())]
+    );
 }
 
 #[test]
@@ -545,6 +645,22 @@ fn rejects_empty_titles_and_questions() {
         add_root_node(&mut graph, qa("Question", " \n\t ", "")),
         Err(GraphError::InvalidMarkdown { reason, .. })
             if reason == "question must not be empty"
+    ));
+    assert!(matches!(
+        add_root_node(
+            &mut graph,
+            NewNode {
+                kind: NodeKind::QuestionAnswer,
+                title: "Empty alternative".to_string(),
+                content: NodeContent::QuestionAnswer {
+                    question: "Why?".to_string(),
+                    answer: String::new(),
+                    alternative_answers: vec![" \n\t ".to_string()],
+                },
+            },
+        ),
+        Err(GraphError::InvalidMarkdown { reason, .. })
+            if reason == "alternative answer must not be empty"
     ));
 
     let parent = add_root_node(&mut graph, statement("Parent", "")).unwrap();
@@ -894,6 +1010,14 @@ fn rebuild_index_reports_sqlite_storage_problems() {
         .unwrap();
     connection
         .execute(
+            "INSERT INTO focal_qa_alternative_answers \
+             (graph_id, node_id, answer_order, answer) \
+             VALUES (?1, ?2, 0, '')",
+            params![graph, qa_node],
+        )
+        .unwrap();
+    connection
+        .execute(
             "INSERT INTO focal_nodes \
              (graph_id, id, kind, title, statement_body, qa_question, qa_answer, \
               created_at_unix, updated_at_unix) \
@@ -956,6 +1080,11 @@ fn rebuild_index_reports_sqlite_storage_problems() {
     assert!(problems.iter().any(|problem| matches!(
         problem,
         GraphProblem::InvalidMarkdown { reason, .. } if reason == "question must not be empty"
+    )));
+    assert!(problems.iter().any(|problem| matches!(
+        problem,
+        GraphProblem::InvalidMarkdown { reason, .. }
+            if reason == "alternative answer must not be empty"
     )));
     assert!(problems.iter().any(|problem| matches!(
         problem,

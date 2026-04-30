@@ -561,6 +561,18 @@ fn validate_content_values(content: &NodeContent, path: &Path) -> Result<(), Gra
                 reason: "question must not be empty".to_string(),
             })
         }
+        NodeContent::QuestionAnswer {
+            alternative_answers,
+            ..
+        } if alternative_answers
+            .iter()
+            .any(|answer| answer.trim().is_empty()) =>
+        {
+            Err(GraphError::InvalidMarkdown {
+                path: path.to_path_buf(),
+                reason: "alternative answer must not be empty".to_string(),
+            })
+        }
         NodeContent::QuestionAnswer { .. } => Ok(()),
     }
 }

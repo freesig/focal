@@ -28,6 +28,7 @@ fn qa(title: &str, question: &str, answer: &str) -> NewNode {
         content: NodeContent::QuestionAnswer {
             question: question.to_string(),
             answer: answer.to_string(),
+            alternative_answers: Vec::new(),
         },
     }
 }
@@ -315,7 +316,8 @@ fn question_answer_nodes_and_traversal_are_deterministic() {
         alpha_node.content,
         NodeContent::QuestionAnswer {
             question: "Why?".to_string(),
-            answer: "Because.".to_string()
+            answer: "Because.".to_string(),
+            alternative_answers: Vec::new(),
         }
     );
 
@@ -634,11 +636,28 @@ fn rejects_invalid_inputs_and_ids() {
         add_root_node(
             &graph,
             NewNode {
+                kind: NodeKind::QuestionAnswer,
+                title: "Empty alternative".to_string(),
+                content: NodeContent::QuestionAnswer {
+                    question: "Why?".to_string(),
+                    answer: String::new(),
+                    alternative_answers: vec![" \n\t ".to_string()],
+                },
+            },
+        ),
+        Err(GraphError::InvalidMarkdown { reason, .. })
+            if reason == "alternative answer must not be empty"
+    ));
+    assert!(matches!(
+        add_root_node(
+            &graph,
+            NewNode {
                 kind: NodeKind::Statement,
                 title: "Mismatch".to_string(),
                 content: NodeContent::QuestionAnswer {
                     question: "Why?".to_string(),
                     answer: String::new(),
+                    alternative_answers: Vec::new(),
                 },
             },
         ),
@@ -1100,6 +1119,7 @@ fn root_and_child_question_answer_nodes_support_empty_answers() {
         NodeContent::QuestionAnswer {
             question: "What is the root?".to_string(),
             answer: String::new(),
+            alternative_answers: Vec::new(),
         }
     );
     assert_eq!(
@@ -1127,6 +1147,10 @@ fn question_answer_updates_keep_identity_paths_and_managed_sections() {
             content: Some(NodeContent::QuestionAnswer {
                 question: "New question?".to_string(),
                 answer: "New answer.".to_string(),
+                alternative_answers: vec![
+                    "Another plausible answer.".to_string(),
+                    "A less likely answer.".to_string(),
+                ],
             }),
         },
     )
@@ -1141,6 +1165,10 @@ fn question_answer_updates_keep_identity_paths_and_managed_sections() {
         NodeContent::QuestionAnswer {
             question: "New question?".to_string(),
             answer: "New answer.".to_string(),
+            alternative_answers: vec![
+                "Another plausible answer.".to_string(),
+                "A less likely answer.".to_string(),
+            ],
         }
     );
 
@@ -1148,6 +1176,9 @@ fn question_answer_updates_keep_identity_paths_and_managed_sections() {
     assert!(markdown.contains("title: New title"));
     assert!(markdown.contains("## Question\n\nNew question?"));
     assert!(markdown.contains("## Answer\n\nNew answer."));
+    assert!(markdown.contains(
+        "## Alternative answers\n\n- Another plausible answer.\n- A less likely answer."
+    ));
     assert!(
         updated
             .canonical_path
@@ -1312,10 +1343,27 @@ fn example_usage_from_spec_runs_as_documented() {
                 answer:
                     "They preserve one canonical Markdown file while allowing multiple parents."
                         .to_string(),
+                alternative_answers: vec![
+                    "They keep shared children visible from multiple branches.".to_string(),
+                    "They avoid copying Markdown while preserving a stable node ID.".to_string(),
+                ],
             },
         },
     )
     .unwrap();
+
+    assert_eq!(
+        read_node(&graph, &qa_id).unwrap().content,
+        NodeContent::QuestionAnswer {
+            question: "Why use symlinks for shared children?".to_string(),
+            answer: "They preserve one canonical Markdown file while allowing multiple parents."
+                .to_string(),
+            alternative_answers: vec![
+                "They keep shared children visible from multiple branches.".to_string(),
+                "They avoid copying Markdown while preserving a stable node ID.".to_string(),
+            ],
+        }
+    );
 
     let descendants =
         list_descendants(&graph, &rust_id, TraversalOptions { max_depth: None }).unwrap();
