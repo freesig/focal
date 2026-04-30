@@ -33,6 +33,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - For `focal-sqlite`, store original idea context documents in SQLite rows scoped to the graph namespace.
 - Provide a `focal-core` crate whose free-function API dispatches to `focal-fs` and, when the `sqlite` feature is enabled, `focal-sqlite` through a concrete `Backend` enum.
 - Support statement nodes and question-answer nodes.
+- Support optional alternative answers on question-answer nodes, ordered by likelihood after the primary answer.
 - Support creating, reading, updating, deleting, and listing graph-level original idea context documents.
 - Support graph navigation from any node.
 - Support listing ancestors and descendants.
@@ -64,6 +65,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - **Context document**: One editable original idea context Markdown document. Context documents are graph-level records and are not linked to individual nodes in the first version.
 - **Context directory**: For `focal-fs`, the top-level `<graph-root>/context/` directory containing context Markdown files.
 - **Node**: One idea entry. A node is either a statement or a question-answer pair.
+- **Alternative answer**: A non-primary high-possibility answer for a question-answer node. Alternative answers are ordered from most likely to least likely after the primary answer.
 - **Node directory**: For `focal-fs`, the directory that contains one node's `node.md` file and `children/` directory.
 - **Canonical node directory**: For `focal-fs`, the real directory that owns the node's Markdown and children.
 - **Alias node directory**: For `focal-fs`, a symlink to a canonical node directory.
@@ -243,13 +245,26 @@ Why should a child node with multiple parents be represented with a symlink?
 
 A symlink lets the graph keep one canonical Markdown file while allowing the
 same node to appear under more than one parent folder.
+
+## Alternative answers
+
+- A symlink records the extra parent placement without duplicating the node's Markdown.
+- It keeps shared children visible from multiple branches while preserving one stable node ID.
 ```
 
 For a question-answer node:
 
 - The question is the Markdown content under `## Question`.
 - The answer is the Markdown content under `## Answer`.
-- The library must reject `qa` files missing either section.
+- Alternative answers are top-level Markdown list items under `## Alternative answers`; library-created files must write each item with a `- ` marker.
+- The `## Answer` content is the most likely answer.
+- Alternative answers are other high-possibility answers, ordered from most likely to least likely after the primary answer.
+- Alternative answers are optional. An empty `## Alternative answers` section represents no alternative answers.
+- Blank lines in an empty or non-empty `## Alternative answers` section are allowed.
+- The `## Alternative answers` section is required even when it is empty.
+- The public alternative answer list contains only non-primary alternatives and must not include the primary `## Answer`.
+- The library must reject `qa` files missing `## Question`, `## Answer`, or `## Alternative answers`.
+- The library must reject non-empty `## Alternative answers` sections that contain content outside top-level Markdown list items.
 
 ### Original Idea Context Markdown
 
@@ -339,7 +354,11 @@ pub struct Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeContent {
     Statement { body: String },
-    QuestionAnswer { question: String, answer: String },
+    QuestionAnswer {
+        question: String,
+        answer: String,
+        alternative_answers: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,6 +416,8 @@ pub struct ContextSummary {
 ```
 
 The implementation may add private fields, but public types should stay small and easy to construct in tests.
+
+For `NodeContent::QuestionAnswer`, `alternative_answers` stores only non-primary alternatives. The primary answer is stored only in `answer`. An empty `alternative_answers` vector represents a valid question-answer node with no alternatives.
 
 For `focal-fs`, `canonical_path`, `alias_paths`, and `GraphEdge.path` are filesystem paths. For `focal-sqlite`, those fields are logical graph paths built from the same slug and node ID format, such as `roots/parent--<id>/children/child--<id>`. They identify the same canonical and alias placements but must not imply that files or directories exist on disk.
 
@@ -954,6 +975,7 @@ Traversal requirements:
 - Editing a statement body.
 - Editing a question.
 - Editing an answer.
+- Editing alternative answers.
 - Editing a title.
 - Updating `updated_at_unix`.
 
@@ -972,7 +994,7 @@ Markdown rewrite rules:
 - Metadata should be rewritten in a stable field order.
 - Existing content should be preserved where possible.
 - For statement nodes, preserve body Markdown.
-- For question-answer nodes, preserve question and answer Markdown except for the managed `## Question` and `## Answer` section headings.
+- For question-answer nodes, preserve question, answer, and alternative answer Markdown except for the managed `## Question`, `## Answer`, and `## Alternative answers` section headings and alternative answer list markers.
 - For context documents, preserve body Markdown except for the managed metadata block.
 
 `update_context_document` must support:
@@ -1021,6 +1043,9 @@ Input validation:
 - Statement body may be empty, but should be allowed.
 - Question text must not be empty after trimming.
 - Answer text may be empty if the caller wants to capture unanswered questions, but the `## Answer` section must exist.
+- Alternative answers are optional and may be an empty list, but the `## Alternative answers` section must exist for `qa` Markdown.
+- Each provided alternative answer must not be empty after trimming.
+- Alternative answers must be stored in caller-provided order, from most likely to least likely after the primary answer.
 - Node ID must be unique.
 - Context document title must not be empty after trimming.
 - Context document Markdown body may be empty.
@@ -1033,6 +1058,7 @@ Input validation:
 - Locate a node by ID anywhere in the graph.
 - Parse metadata.
 - Parse content according to `kind`.
+- For question-answer nodes, return alternative answers in stored order without including the primary answer.
 - Return canonical path and alias paths. For `focal-sqlite`, these are logical graph paths.
 - For `focal-fs`, return an error if multiple real canonical directories claim the same ID.
 - For `focal-fs`, return an error if the node is found only as a broken symlink.
@@ -1292,19 +1318,24 @@ Adding:
 
 - Add a root statement node.
 - Add a root question-answer node.
+- Add a root question-answer node with alternative answers.
 - Add a child statement node.
 - Add a child question-answer node.
+- Add a child question-answer node with an empty alternative answer list.
 - Add multiple context documents.
 - Verify generated node IDs are UUID strings.
 - Verify generated context document IDs are UUID strings.
 - Reject empty titles.
 - Reject empty context document titles.
 - Reject empty questions for `qa` nodes.
+- Reject question-answer Markdown that omits the required `## Alternative answers` section.
+- Reject non-empty alternative answer sections that are not written as Markdown list items.
 
 Reading:
 
 - Read a statement node from its ID.
 - Read a question-answer node from its ID.
+- Read a question-answer node and verify ordered alternative answers are returned without the primary answer duplicated in the list.
 - Read a context document from its ID.
 - List context documents in deterministic order.
 - For `focal-fs`, read a node through a symlink parent and get the canonical content.
@@ -1315,6 +1346,7 @@ Editing:
 - Update statement body.
 - Update question text.
 - Update answer text.
+- Update alternative answers.
 - Update title and verify metadata updates.
 - Verify title edits do not require a top-level `# Heading`.
 - Verify title edits do not rename the node directory or logical path.
@@ -1444,7 +1476,7 @@ Storage requirements:
 
 - Store graph namespace metadata in SQLite.
 - Store context documents in SQLite with stable UUID context document IDs, filename, title, Markdown body, `created_at_unix`, and `updated_at_unix`.
-- Store nodes in SQLite with stable UUID node IDs, kind, title, Markdown content fields, `created_at_unix`, and `updated_at_unix`.
+- Store nodes in SQLite with stable UUID node IDs, kind, title, Markdown content fields, ordered question-answer alternative answers, `created_at_unix`, and `updated_at_unix`.
 - Store parent-child relationships in SQLite as placement rows scoped to the graph namespace.
 - Each `(graph_name, context_id)` context document must be unique.
 - Each `(graph_name, filename)` context document filename should be unique.
@@ -1466,7 +1498,8 @@ Behavioral requirements:
 - `delete_context_document` deletes only the selected context document row and must not alter nodes, placements, or edges.
 - `list_context_documents` returns context summaries in deterministic order.
 - `add_root_node` and `add_child_node` insert node and placement rows scoped to the selected graph namespace instead of creating directories and Markdown files.
-- `read_node` returns node content from the canonical node row, with logical canonical and alias paths.
+- `read_node` returns node content from the canonical node row, including ordered question-answer alternative answers, with logical canonical and alias paths.
+- `update_node` updates question-answer alternative answers in caller-provided order when the patch replaces question-answer content.
 - `link_existing_node` creates an alias placement row when the edge does not already exist, except when linking a root node with no other parents under a parent; in that case it moves the root's canonical placement under the new parent to match `focal-fs`.
 - `unlink_child` removes only the requested placement and applies the same orphan policies as `focal-fs`.
 - Promotion chooses the lexicographically first alias logical path and marks that placement canonical.
@@ -1483,7 +1516,7 @@ Consistency requirements:
 Testing requirements:
 
 - The shared public API behavior tests should run against `focal-sqlite` with SQLite-backed storage.
-- Tests should cover SQLite schema initialization, opening an existing SQLite graph namespace, context document CRUD and listing, alias placement creation, promotion, recursive delete with shared descendants, traversal determinism, validation, and storage errors.
+- Tests should cover SQLite schema initialization, opening an existing SQLite graph namespace, context document CRUD and listing, ordered question-answer alternative answer storage and updates, alias placement creation, promotion, recursive delete with shared descendants, traversal determinism, validation, and storage errors.
 
 ## Spec Test Traceability
 
@@ -1553,6 +1586,10 @@ let qa_id = add_child_node(
         content: NodeContent::QuestionAnswer {
             question: "Why use symlinks for shared children?".to_string(),
             answer: "They preserve one canonical Markdown file while allowing multiple parents.".to_string(),
+            alternative_answers: vec![
+                "They keep shared children visible from multiple branches.".to_string(),
+                "They avoid copying Markdown while preserving a stable node ID.".to_string(),
+            ],
         },
     },
 )?;
@@ -1582,6 +1619,8 @@ The shared graph behavior is acceptable when:
 - For `focal-fs`, no `.idea-graph/VERSION` file is required.
 - Multiple original idea context Markdown documents can be added, read, updated, listed, and deleted.
 - Statement and question-answer nodes can be added, read, updated, and deleted.
+- Question-answer nodes can store optional ordered alternative answers that are created, read, and updated through the public API.
+- Question-answer Markdown always includes `## Question`, `## Answer`, and `## Alternative answers` sections.
 - Generated node IDs are UUID strings.
 - Generated context document IDs are UUID strings.
 - Context documents are graph-level only and are not linked to individual nodes.
