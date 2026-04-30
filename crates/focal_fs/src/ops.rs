@@ -4,31 +4,36 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GraphError;
 use crate::fs_utils::{
-    children_path, create_relative_dir_symlink, ensure_real_dir_inside, generate_node_id,
-    is_path_inside_any, node_file_path, now_unix, path_sort_key, real_dir_exists, roots_path,
-    safe_remove_dir_all, safe_remove_file, safe_rename, unique_node_path, validate_node_id,
+    children_path, context_path, create_relative_dir_symlink, ensure_real_dir_inside,
+    generate_context_id, generate_node_id, is_path_inside_any, node_file_path, now_unix,
+    path_sort_key, real_dir_exists, roots_path, safe_remove_dir_all, safe_remove_file, safe_rename,
+    unique_context_file_path, unique_node_path, validate_context_id, validate_node_id,
     validate_title, write_file_atomically,
 };
-use crate::markdown::render_node_markdown;
+use crate::markdown::{render_context_markdown, render_node_markdown};
 use crate::model::{
-    DeleteMode, GraphIndex, IdeaGraph, NewNode, Node, NodeContent, NodeId, NodeKind, NodePatch,
+    ContextDocument, ContextDocumentPatch, ContextId, ContextSummary, DeleteMode, GraphIndex,
+    IdeaGraph, NewContextDocument, NewNode, Node, NodeContent, NodeId, NodeKind, NodePatch,
     NodeSummary, OrphanPolicy, TraversalOptions,
 };
 use crate::scan::{
-    ScanResult, ScannedNode, canonical_node, canonical_path, child_edges,
+    ScanResult, ScannedContext, ScannedNode, canonical_context, canonical_node, canonical_path,
+    child_edges, context_document, context_problem_error, context_summary,
     entry_problem_error_for_node_id, find_edge, graph_index, node_summary, parent_edges,
-    problem_error_under_container, scan_graph, sort_summaries, summary_for,
+    problem_error_under_container, scan_graph, sort_context_summaries, sort_summaries, summary_for,
 };
 
 pub fn init_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError> {
     let root = crate::fs_utils::absolute_path(root.as_ref())?;
     fs::create_dir_all(roots_path(&root))?;
+    fs::create_dir_all(context_path(&root))?;
     if !real_dir_exists(&roots_path(&root))? {
         return Err(GraphError::InvalidGraphRoot(format!(
             "{} does not contain a real roots/ directory",
             root.display()
         )));
     }
+    ensure_context_directory(&root)?;
     let root = root.canonicalize()?;
     Ok(IdeaGraph { root })
 }
@@ -41,7 +46,100 @@ pub fn open_graph(root: impl AsRef<Path>) -> Result<IdeaGraph, GraphError> {
             root.display()
         )));
     }
+    ensure_context_directory(&root)?;
     Ok(IdeaGraph { root })
+}
+
+pub fn add_context_document(
+    graph: &IdeaGraph,
+    context: NewContextDocument,
+) -> Result<ContextId, GraphError> {
+    validate_new_context_document(&context)?;
+    let scan = scan_graph(graph)?;
+    let context_dir = context_path(&graph.root);
+    ensure_real_dir_inside(&graph.root, &context_dir)?;
+    let id = loop {
+        let id = generate_context_id();
+        if !scan.contexts.contains_key(&id) {
+            break id;
+        }
+    };
+    let path = unique_context_file_path(&context_dir, &context.title, &id)?;
+    let created_at_unix = now_unix();
+    write_context_markdown(
+        &graph.root,
+        &path,
+        &id,
+        &context.title,
+        created_at_unix,
+        created_at_unix,
+        &context.markdown,
+    )?;
+
+    Ok(id)
+}
+
+pub fn read_context_document(
+    graph: &IdeaGraph,
+    context_id: &str,
+) -> Result<ContextDocument, GraphError> {
+    validate_context_id(context_id)?;
+    let scan = scan_graph(graph)?;
+    let context = canonical_context(&scan, context_id)?;
+    context_document(context).ok_or_else(|| GraphError::ContextNotFound(context_id.to_string()))
+}
+
+pub fn update_context_document(
+    graph: &IdeaGraph,
+    context_id: &str,
+    patch: ContextDocumentPatch,
+) -> Result<ContextDocument, GraphError> {
+    validate_context_id(context_id)?;
+    let scan = scan_graph(graph)?;
+    let context = canonical_context(&scan, context_id)?;
+    let path = context_path_for_update(context, context_id)?;
+    let title = match patch.title {
+        Some(title) => {
+            validate_title(&title)?;
+            title
+        }
+        None => context.title.clone(),
+    };
+    let markdown = patch.markdown.unwrap_or_else(|| context.markdown.clone());
+    let updated_at_unix = now_unix().max(context.updated_at_unix.saturating_add(1));
+    write_context_markdown(
+        &graph.root,
+        &path,
+        context_id,
+        &title,
+        context.created_at_unix,
+        updated_at_unix,
+        &markdown,
+    )?;
+
+    read_context_document(graph, context_id)
+}
+
+pub fn delete_context_document(graph: &IdeaGraph, context_id: &str) -> Result<(), GraphError> {
+    validate_context_id(context_id)?;
+    let scan = scan_graph(graph)?;
+    let context = canonical_context(&scan, context_id)?;
+    let path = context_path_for_update(context, context_id)?;
+    safe_remove_file(&graph.root, &path)
+}
+
+pub fn list_context_documents(graph: &IdeaGraph) -> Result<Vec<ContextSummary>, GraphError> {
+    let scan = scan_graph(graph)?;
+    if let Some(error) = context_problem_error(&scan) {
+        return Err(error);
+    }
+    let mut summaries = scan
+        .contexts
+        .values()
+        .filter_map(context_summary)
+        .collect::<Vec<_>>();
+    sort_context_summaries(&mut summaries);
+    Ok(summaries)
 }
 
 pub fn add_root_node(graph: &IdeaGraph, node: NewNode) -> Result<NodeId, GraphError> {
@@ -296,6 +394,57 @@ pub fn list_descendants(
 
 pub fn rebuild_index(graph: &IdeaGraph) -> Result<GraphIndex, GraphError> {
     Ok(graph_index(&scan_graph(graph)?))
+}
+
+fn ensure_context_directory(root: &Path) -> Result<(), GraphError> {
+    let context_dir = context_path(root);
+    match fs::symlink_metadata(&context_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(GraphError::InvalidGraphRoot(format!(
+            "{} is not a real context/ directory",
+            context_dir.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&context_dir)?;
+            if real_dir_exists(&context_dir)? {
+                Ok(())
+            } else {
+                Err(GraphError::InvalidGraphRoot(format!(
+                    "{} is not a real context/ directory",
+                    context_dir.display()
+                )))
+            }
+        }
+        Err(error) => Err(GraphError::Io(error)),
+    }
+}
+
+fn validate_new_context_document(context: &NewContextDocument) -> Result<(), GraphError> {
+    validate_title(&context.title)
+}
+
+fn write_context_markdown(
+    root: &Path,
+    path: &Path,
+    id: &str,
+    title: &str,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    markdown: &str,
+) -> Result<(), GraphError> {
+    let rendered = render_context_markdown(id, title, created_at_unix, updated_at_unix, markdown);
+    write_file_atomically(root, path, &rendered)
+}
+
+fn context_path_for_update(
+    context: &ScannedContext,
+    context_id: &str,
+) -> Result<PathBuf, GraphError> {
+    context
+        .paths
+        .first()
+        .cloned()
+        .ok_or_else(|| GraphError::ContextNotFound(context_id.to_string()))
 }
 
 fn require_parent_node<'a>(

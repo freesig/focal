@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::error::GraphError;
 
 pub(crate) const ROOTS_DIR: &str = "roots";
+pub(crate) const CONTEXT_DIR: &str = "context";
 pub(crate) const NODE_FILE: &str = "node.md";
 pub(crate) const CHILDREN_DIR: &str = "children";
 const MAX_SLUG_BYTES: usize = 80;
@@ -22,17 +23,29 @@ pub(crate) fn now_unix() -> u64 {
 }
 
 pub(crate) fn validate_node_id(id: &str) -> Result<(), GraphError> {
+    if !is_valid_uuid_id(id) {
+        return Err(GraphError::InvalidNodeId(id.to_string()));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_context_id(id: &str) -> Result<(), GraphError> {
+    if !is_valid_uuid_id(id) {
+        return Err(GraphError::InvalidContextId(id.to_string()));
+    }
+
+    Ok(())
+}
+
+fn is_valid_uuid_id(id: &str) -> bool {
     let valid_shape = id.len() == 36
         && id.char_indices().all(|(index, ch)| match index {
             8 | 13 | 18 | 23 => ch == '-',
             _ => ch.is_ascii_digit() || ('a'..='f').contains(&ch),
         });
 
-    if !valid_shape || Uuid::parse_str(id).is_err() {
-        return Err(GraphError::InvalidNodeId(id.to_string()));
-    }
-
-    Ok(())
+    valid_shape && Uuid::parse_str(id).is_ok()
 }
 
 pub(crate) fn validate_title(title: &str) -> Result<(), GraphError> {
@@ -43,6 +56,10 @@ pub(crate) fn validate_title(title: &str) -> Result<(), GraphError> {
 }
 
 pub(crate) fn generate_node_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub(crate) fn generate_context_id() -> String {
     Uuid::new_v4().to_string()
 }
 
@@ -97,6 +114,32 @@ pub(crate) fn unique_node_path(
     }
 }
 
+pub(crate) fn unique_context_file_path(
+    context_dir: &Path,
+    title: &str,
+    id: &str,
+) -> Result<PathBuf, GraphError> {
+    let slug = slugify(title);
+    let mut suffix = 1usize;
+
+    loop {
+        let name = if suffix == 1 {
+            format!("{slug}--{id}.md")
+        } else {
+            format!("{slug}-{suffix}--{id}.md")
+        };
+        let candidate = context_dir.join(name);
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(GraphError::Io(error)),
+        }
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| GraphError::AliasConflict(context_dir.to_path_buf()))?;
+    }
+}
+
 pub(crate) fn node_id_from_dir_name(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy();
     let (_, id) = name.rsplit_once("--")?;
@@ -107,8 +150,23 @@ pub(crate) fn node_id_from_dir_name(path: &Path) -> Option<String> {
     }
 }
 
+pub(crate) fn context_id_from_file_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    let stem = name.strip_suffix(".md")?;
+    let (_, id) = stem.rsplit_once("--")?;
+    if validate_context_id(id).is_ok() {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn roots_path(root: &Path) -> PathBuf {
     root.join(ROOTS_DIR)
+}
+
+pub(crate) fn context_path(root: &Path) -> PathBuf {
+    root.join(CONTEXT_DIR)
 }
 
 pub(crate) fn node_file_path(node_dir: &Path) -> PathBuf {
@@ -307,6 +365,14 @@ pub(crate) fn has_node_dir_suffix(path: &Path, id: &str) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
         .and_then(|name| name.rsplit_once("--").map(|(_, suffix)| suffix))
+        .is_some_and(|suffix| suffix == id)
+}
+
+pub(crate) fn has_context_file_suffix(path: &Path, id: &str) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_suffix(".md"))
+        .and_then(|stem| stem.rsplit_once("--").map(|(_, suffix)| suffix))
         .is_some_and(|suffix| suffix == id)
 }
 

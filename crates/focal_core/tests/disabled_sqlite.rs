@@ -1,8 +1,9 @@
 #![cfg(not(feature = "sqlite"))]
 
 use focal_core::{
-    self as core, DeleteMode, Error, GraphIndex, NewNode, Node, NodeContent, NodeId, NodeKind,
-    NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
+    self as core, ContextDocument, ContextDocumentPatch, ContextId, ContextSummary, DeleteMode,
+    Error, GraphIndex, NewContextDocument, NewNode, Node, NodeContent, NodeId, NodeKind, NodePatch,
+    NodeSummary, OrphanPolicy, TraversalOptions,
 };
 use std::fmt::Debug;
 
@@ -37,6 +38,21 @@ fn disabled_sqlite_backend_returns_disabled_error_for_every_operation() {
 
     assert_disabled::<NodeId>(core::add_root_node(&mut backend, statement()));
     assert_disabled::<NodeId>(core::add_child_node(&mut backend, PARENT_ID, statement()));
+    assert_disabled::<ContextId>(core::add_context_document(
+        &mut backend,
+        NewContextDocument {
+            title: "Context".to_string(),
+            markdown: String::new(),
+        },
+    ));
+    assert_disabled::<ContextDocument>(core::read_context_document(&backend, CHILD_ID));
+    assert_disabled::<ContextDocument>(core::update_context_document(
+        &mut backend,
+        CHILD_ID,
+        ContextDocumentPatch::default(),
+    ));
+    assert_disabled::<()>(core::delete_context_document(&mut backend, CHILD_ID));
+    assert_disabled::<Vec<ContextSummary>>(core::list_context_documents(&backend));
     assert_disabled::<Node>(core::read_node(&backend, CHILD_ID));
     assert_disabled::<Node>(core::update_node(
         &mut backend,

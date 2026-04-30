@@ -1,8 +1,10 @@
 use focal_sqlite::{
-    DeleteMode, GraphError, GraphProblem, NewNode, NodeContent, NodeKind, NodePatch, OrphanPolicy,
-    TraversalOptions, add_child_node, add_root_node, delete_node, init_graph, link_existing_node,
-    list_ancestors, list_children, list_descendants, list_parents, list_roots, open_database,
-    open_graph, read_node, rebuild_index, unlink_child, update_node,
+    ContextDocumentPatch, DeleteMode, GraphError, GraphProblem, NewContextDocument, NewNode,
+    NodeContent, NodeKind, NodePatch, OrphanPolicy, TraversalOptions, add_child_node,
+    add_context_document, add_root_node, delete_context_document, delete_node, init_graph,
+    link_existing_node, list_ancestors, list_children, list_context_documents, list_descendants,
+    list_parents, list_roots, open_database, open_graph, read_context_document, read_node,
+    rebuild_index, unlink_child, update_context_document, update_node,
 };
 use rusqlite::{Connection, params};
 use tempfile::NamedTempFile;
@@ -94,6 +96,232 @@ fn init_open_and_namespace_isolation() {
     assert!(matches!(
         init_graph(&mut connection, " \n"),
         Err(GraphError::InvalidGraphRoot(_))
+    ));
+}
+
+#[test]
+fn open_graph_requires_context_schema_table() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE focal_graphs (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE focal_nodes (
+                graph_id INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                statement_body TEXT,
+                qa_question TEXT,
+                qa_answer TEXT,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE focal_placements (
+                id INTEGER PRIMARY KEY,
+                graph_id INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                logical_path TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL
+            );
+            INSERT INTO focal_graphs (name, created_at_unix) VALUES ('main', 1);
+            ",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        open_graph(&mut connection, "main"),
+        Err(GraphError::InvalidGraphRoot(message))
+            if message.contains("focal_context_documents")
+    ));
+}
+
+#[test]
+fn context_documents_crud_namespace_sort_and_stable_filename() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let (root, alpha, beta, original_filename, original_path) = {
+        let mut graph = init_graph(&mut connection, "main").unwrap();
+        let root = add_root_node(&mut graph, statement("Root", "node body")).unwrap();
+        let beta = add_context_document(
+            &mut graph,
+            NewContextDocument {
+                title: "Beta notes".to_string(),
+                markdown: "# Human heading\n\nBeta body".to_string(),
+            },
+        )
+        .unwrap();
+        let alpha = add_context_document(
+            &mut graph,
+            NewContextDocument {
+                title: "Alpha notes".to_string(),
+                markdown: String::new(),
+            },
+        )
+        .unwrap();
+        assert_uuid_shape(&beta);
+        assert_uuid_shape(&alpha);
+
+        let listed = list_context_documents(&graph).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|context| context.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![alpha.as_str(), beta.as_str()]
+        );
+        assert!(listed[0].path.starts_with("context"));
+
+        let before = read_context_document(&graph, &beta).unwrap();
+        assert_eq!(before.markdown, "# Human heading\n\nBeta body");
+        assert!(before.filename.ends_with(format!("--{beta}.md").as_str()));
+        let original_filename = before.filename.clone();
+        let original_path = before.path.clone();
+
+        let updated = update_context_document(
+            &mut graph,
+            &beta,
+            ContextDocumentPatch {
+                title: Some("Renamed context".to_string()),
+                markdown: Some("Updated body".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.id, beta);
+        assert_eq!(updated.filename, original_filename);
+        assert_eq!(updated.path, original_path);
+        assert_eq!(updated.markdown, "Updated body");
+        assert!(updated.updated_at_unix > before.updated_at_unix);
+
+        let index = rebuild_index(&graph).unwrap();
+        assert_eq!(index.contexts.len(), 2);
+        assert_eq!(read_node(&graph, &root).unwrap().title, "Root");
+
+        (root, alpha, beta, updated.filename, updated.path)
+    };
+
+    {
+        let mut other = init_graph(&mut connection, "other").unwrap();
+        assert!(list_context_documents(&other).unwrap().is_empty());
+        add_context_document(
+            &mut other,
+            NewContextDocument {
+                title: "Beta notes".to_string(),
+                markdown: "Other graph".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(list_context_documents(&other).unwrap().len(), 1);
+    }
+
+    {
+        let mut graph = open_graph(&mut connection, "main").unwrap();
+        assert_eq!(
+            read_context_document(&graph, &beta).unwrap().filename,
+            original_filename
+        );
+        assert_eq!(
+            read_context_document(&graph, &beta).unwrap().path,
+            original_path
+        );
+        delete_context_document(&mut graph, &beta).unwrap();
+        assert!(matches!(
+            read_context_document(&graph, &beta),
+            Err(GraphError::ContextNotFound(id)) if id == beta
+        ));
+        assert_eq!(
+            list_context_documents(&graph)
+                .unwrap()
+                .into_iter()
+                .map(|context| context.id)
+                .collect::<Vec<_>>(),
+            vec![alpha]
+        );
+        assert_eq!(read_node(&graph, &root).unwrap().id, root);
+    }
+}
+
+#[test]
+fn context_documents_reject_invalid_inputs_and_report_bad_rows() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let valid = {
+        let mut graph = init_graph(&mut connection, "main").unwrap();
+        let valid = add_context_document(
+            &mut graph,
+            NewContextDocument {
+                title: "Valid".to_string(),
+                markdown: "Body".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            add_context_document(
+                &mut graph,
+                NewContextDocument {
+                    title: " \n\t ".to_string(),
+                    markdown: String::new(),
+                },
+            ),
+            Err(GraphError::InvalidTitle)
+        ));
+        assert!(matches!(
+            read_context_document(&graph, "../not-an-id"),
+            Err(GraphError::InvalidContextId(_))
+        ));
+        valid
+    };
+    let graph = graph_id(&connection, "main");
+    let bad_id = "550e8400-e29b-41d4-a716-446655440000";
+    let wrong_suffix = "7d9f2e5c-0f22-4c18-a0be-9f23e772a0bc";
+
+    connection
+        .execute(
+            "INSERT INTO focal_context_documents \
+             (graph_id, id, slug, filename, title, markdown, created_at_unix, updated_at_unix) \
+             VALUES (?1, 'not-a-uuid', 'bad', 'bad--not-a-uuid.md', 'Bad ID', '', 1, 1)",
+            params![graph],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO focal_context_documents \
+             (graph_id, id, slug, filename, title, markdown, created_at_unix, updated_at_unix) \
+             VALUES (?1, ?2, 'mismatch', ?3, 'Mismatch', '', 1, 1)",
+            params![graph, bad_id, format!("mismatch--{wrong_suffix}.md")],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE focal_context_documents \
+             SET title = '' WHERE graph_id = ?1 AND id = ?2",
+            params![graph, valid],
+        )
+        .unwrap();
+
+    let graph = open_graph(&mut connection, "main").unwrap();
+    let problems = rebuild_index(&graph).unwrap().problems;
+    assert!(problems.iter().any(|problem| matches!(
+        problem,
+        GraphProblem::InvalidContextMarkdown { reason, .. }
+            if reason.contains("invalid context id")
+    )));
+    assert!(problems.iter().any(|problem| matches!(
+        problem,
+        GraphProblem::InvalidContextMarkdown { reason, .. }
+            if reason == "context filename id suffix does not match context id"
+    )));
+    assert!(problems.iter().any(|problem| matches!(
+        problem,
+        GraphProblem::InvalidContextMarkdown { reason, .. } if reason == "invalid title"
+    )));
+    assert!(matches!(
+        list_context_documents(&graph),
+        Err(GraphError::InvalidContextMarkdown { .. })
     ));
 }
 

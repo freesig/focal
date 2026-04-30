@@ -4,14 +4,28 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GraphError;
 use crate::fs_utils::{
-    NODE_FILE, children_path, has_node_dir_suffix, node_file_path, node_id_from_dir_name,
-    real_dir_exists, real_file_exists, resolve_symlink_path, roots_path, validate_node_id,
-    validate_title,
+    NODE_FILE, children_path, context_id_from_file_name, context_path, has_context_file_suffix,
+    has_node_dir_suffix, node_file_path, node_id_from_dir_name, real_dir_exists, real_file_exists,
+    resolve_symlink_path, roots_path, validate_context_id, validate_node_id, validate_title,
 };
-use crate::markdown::{ParsedMarkdown, parse_node_markdown};
+use crate::markdown::{
+    ParsedContextMarkdown, ParsedMarkdown, parse_context_markdown, parse_node_markdown,
+};
 use crate::model::{
-    GraphEdge, GraphIndex, GraphProblem, IdeaGraph, NodeContent, NodeKind, NodeSummary,
+    ContextDocument, ContextSummary, GraphEdge, GraphIndex, GraphProblem, IdeaGraph, NodeContent,
+    NodeKind, NodeSummary,
 };
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScannedContext {
+    pub id: String,
+    pub title: String,
+    pub filename: String,
+    pub markdown: String,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    pub paths: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScannedNode {
@@ -39,6 +53,31 @@ pub(crate) fn node_summary(node: &ScannedNode, is_alias: bool) -> Option<NodeSum
     })
 }
 
+pub(crate) fn context_path_for(context: &ScannedContext) -> Option<&Path> {
+    context.paths.first().map(PathBuf::as_path)
+}
+
+pub(crate) fn context_summary(context: &ScannedContext) -> Option<ContextSummary> {
+    Some(ContextSummary {
+        id: context.id.clone(),
+        title: context.title.clone(),
+        filename: context.filename.clone(),
+        path: context_path_for(context)?.to_path_buf(),
+    })
+}
+
+pub(crate) fn context_document(context: &ScannedContext) -> Option<ContextDocument> {
+    Some(ContextDocument {
+        id: context.id.clone(),
+        title: context.title.clone(),
+        filename: context.filename.clone(),
+        markdown: context.markdown.clone(),
+        created_at_unix: context.created_at_unix,
+        updated_at_unix: context.updated_at_unix,
+        path: context_path_for(context)?.to_path_buf(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RootEntry {
     pub id: String,
@@ -53,6 +92,7 @@ pub(crate) struct BrokenSymlinkEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScanResult {
+    pub contexts: BTreeMap<String, ScannedContext>,
     pub nodes: BTreeMap<String, ScannedNode>,
     pub edges: Vec<GraphEdge>,
     pub root_entries: Vec<RootEntry>,
@@ -88,6 +128,26 @@ pub(crate) fn canonical_node<'a>(
         return Err(error);
     }
     Ok(node)
+}
+
+pub(crate) fn canonical_context<'a>(
+    scan: &'a ScanResult,
+    id: &str,
+) -> Result<&'a ScannedContext, GraphError> {
+    validate_context_id(id)?;
+    let Some(context) = scan.contexts.get(id) else {
+        return match entry_problem_error_for_context_id(scan, id) {
+            Some(error) => Err(error),
+            None => Err(GraphError::ContextNotFound(id.to_string())),
+        };
+    };
+    if context.paths.len() > 1 {
+        return Err(GraphError::DuplicateContextDocument {
+            id: id.to_string(),
+            paths: context.paths.clone(),
+        });
+    }
+    Ok(context)
 }
 
 pub(crate) fn child_edges<'a>(scan: &'a ScanResult, parent_id: &str) -> Vec<&'a GraphEdge> {
@@ -131,7 +191,37 @@ pub(crate) fn entry_problem_error_for_node_id(scan: &ScanResult, id: &str) -> Op
         .map(graph_problem_to_error)
 }
 
+pub(crate) fn entry_problem_error_for_context_id(
+    scan: &ScanResult,
+    id: &str,
+) -> Option<GraphError> {
+    scan.problems
+        .iter()
+        .find(|problem| graph_problem_context_id(problem).as_deref() == Some(id))
+        .map(graph_problem_to_error)
+}
+
+pub(crate) fn context_problem_error(scan: &ScanResult) -> Option<GraphError> {
+    scan.problems
+        .iter()
+        .find(|problem| {
+            matches!(
+                problem,
+                GraphProblem::DuplicateContextDocument { .. }
+                    | GraphProblem::InvalidContextMarkdown { .. }
+            )
+        })
+        .map(graph_problem_to_error)
+}
+
 pub(crate) fn graph_index(scan: &ScanResult) -> GraphIndex {
+    let mut contexts = scan
+        .contexts
+        .values()
+        .filter_map(context_summary)
+        .collect::<Vec<_>>();
+    sort_context_summaries(&mut contexts);
+
     let mut nodes = scan
         .nodes
         .values()
@@ -148,6 +238,7 @@ pub(crate) fn graph_index(scan: &ScanResult) -> GraphIndex {
     });
 
     GraphIndex {
+        contexts,
         nodes,
         edges,
         problems: scan.problems.clone(),
@@ -162,10 +253,12 @@ pub(crate) fn scan_graph(graph: &IdeaGraph) -> Result<ScanResult, GraphError> {
             graph.root.display()
         )));
     }
+    ensure_context_dir(graph)?;
 
     let mut scanner = Scanner {
         graph,
         result: ScanResult {
+            contexts: BTreeMap::new(),
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             root_entries: Vec::new(),
@@ -173,6 +266,7 @@ pub(crate) fn scan_graph(graph: &IdeaGraph) -> Result<ScanResult, GraphError> {
             problems: Vec::new(),
         },
     };
+    scan_context_documents(&mut scanner)?;
     scan_container(&mut scanner, &roots, None)?;
     detect_cycles(&mut scanner.result);
     Ok(scanner.result)
@@ -187,9 +281,126 @@ pub(crate) fn sort_summaries(summaries: &mut [NodeSummary]) {
     });
 }
 
+pub(crate) fn sort_context_summaries(summaries: &mut [ContextSummary]) {
+    summaries.sort_by(|left, right| {
+        left.title
+            .cmp(&right.title)
+            .then(left.id.cmp(&right.id))
+            .then(left.path.cmp(&right.path))
+    });
+}
+
 struct Scanner<'a> {
     graph: &'a IdeaGraph,
     result: ScanResult,
+}
+
+fn ensure_context_dir(graph: &IdeaGraph) -> Result<(), GraphError> {
+    let context_dir = context_path(&graph.root);
+    match fs::symlink_metadata(&context_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(GraphError::InvalidGraphRoot(format!(
+            "{} is not a real context/ directory",
+            context_dir.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&context_dir)?;
+            if real_dir_exists(&context_dir)? {
+                Ok(())
+            } else {
+                Err(GraphError::InvalidGraphRoot(format!(
+                    "{} is not a real context/ directory",
+                    context_dir.display()
+                )))
+            }
+        }
+        Err(error) => Err(GraphError::Io(error)),
+    }
+}
+
+fn scan_context_documents(scanner: &mut Scanner<'_>) -> Result<(), GraphError> {
+    let context_dir = context_path(&scanner.graph.root);
+    let mut entries = match fs::read_dir(&context_dir) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(GraphError::Io(error)),
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            scanner
+                .result
+                .problems
+                .push(GraphProblem::InvalidContextMarkdown {
+                    path,
+                    reason: "context document must be a regular Markdown file".to_string(),
+                });
+            continue;
+        }
+        scan_context_file(&mut scanner.result, &path)?;
+    }
+
+    Ok(())
+}
+
+fn scan_context_file(result: &mut ScanResult, path: &Path) -> Result<(), GraphError> {
+    let Some(filename) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+    else {
+        result.problems.push(GraphProblem::InvalidContextMarkdown {
+            path: path.to_path_buf(),
+            reason: "context document file name must be valid UTF-8".to_string(),
+        });
+        return Ok(());
+    };
+    if context_id_from_file_name(path).is_none() {
+        result.problems.push(GraphProblem::InvalidContextMarkdown {
+            path: path.to_path_buf(),
+            reason: "context file name must end with `--<context-id>.md`".to_string(),
+        });
+        return Ok(());
+    }
+
+    let source = fs::read_to_string(path)?;
+    let parsed = match parse_context_markdown(&source) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            result.problems.push(GraphProblem::InvalidContextMarkdown {
+                path: path.to_path_buf(),
+                reason,
+            });
+            return Ok(());
+        }
+    };
+    if let Err(error) = validate_context_id(&parsed.id) {
+        result.problems.push(GraphProblem::InvalidContextMarkdown {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        });
+        return Ok(());
+    }
+    if let Err(error) = validate_title(&parsed.title) {
+        result.problems.push(GraphProblem::InvalidContextMarkdown {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        });
+        return Ok(());
+    }
+    if !has_context_file_suffix(path, &parsed.id) {
+        result.problems.push(GraphProblem::InvalidContextMarkdown {
+            path: path.to_path_buf(),
+            reason: "context file id suffix does not match metadata id".to_string(),
+        });
+        return Ok(());
+    }
+
+    add_context(result, path.to_path_buf(), filename, parsed);
+    Ok(())
 }
 
 fn scan_container(
@@ -386,6 +597,31 @@ fn add_broken_symlink(result: &mut ScanResult, link_path: &Path, parent_id: Opti
     result.problems.push(GraphProblem::BrokenSymlink { path });
 }
 
+fn add_context(
+    result: &mut ScanResult,
+    path: PathBuf,
+    filename: String,
+    parsed: ParsedContextMarkdown,
+) {
+    let context = result
+        .contexts
+        .entry(parsed.id.clone())
+        .or_insert_with(|| scanned_context_from_parsed(&filename, &parsed));
+
+    if !context.paths.contains(&path) {
+        context.paths.push(path);
+        context.paths.sort();
+    }
+    if context.paths.len() > 1 {
+        result
+            .problems
+            .push(GraphProblem::DuplicateContextDocument {
+                id: context.id.clone(),
+                paths: context.paths.clone(),
+            });
+    }
+}
+
 fn add_canonical(result: &mut ScanResult, path: PathBuf, parsed: ParsedMarkdown) {
     let node = result
         .nodes
@@ -413,6 +649,18 @@ fn add_alias(result: &mut ScanResult, id: &str, path: PathBuf, parsed: ParsedMar
     if !node.alias_paths.contains(&path) {
         node.alias_paths.push(path);
         node.alias_paths.sort();
+    }
+}
+
+fn scanned_context_from_parsed(filename: &str, parsed: &ParsedContextMarkdown) -> ScannedContext {
+    ScannedContext {
+        id: parsed.id.clone(),
+        title: parsed.title.clone(),
+        filename: filename.to_string(),
+        markdown: parsed.markdown.clone(),
+        created_at_unix: parsed.created_at_unix,
+        updated_at_unix: parsed.updated_at_unix,
+        paths: Vec::new(),
     }
 }
 
@@ -500,7 +748,18 @@ fn graph_problem_node_id(problem: &GraphProblem) -> Option<String> {
         | GraphProblem::MissingNodeMarkdown { path }
         | GraphProblem::MissingChildrenDirectory { path }
         | GraphProblem::InvalidMarkdown { path, .. } => problem_path_node_id(path),
-        GraphProblem::DuplicateCanonicalNode { .. } | GraphProblem::CycleDetected { .. } => None,
+        GraphProblem::DuplicateCanonicalNode { .. }
+        | GraphProblem::DuplicateContextDocument { .. }
+        | GraphProblem::InvalidContextMarkdown { .. }
+        | GraphProblem::CycleDetected { .. } => None,
+    }
+}
+
+fn graph_problem_context_id(problem: &GraphProblem) -> Option<String> {
+    match problem {
+        GraphProblem::DuplicateContextDocument { id, .. } => Some(id.clone()),
+        GraphProblem::InvalidContextMarkdown { path, .. } => context_id_from_file_name(path),
+        _ => None,
     }
 }
 
@@ -514,10 +773,22 @@ fn problem_path_node_id(path: &Path) -> Option<String> {
 fn graph_problem_to_error(problem: &GraphProblem) -> GraphError {
     match problem {
         GraphProblem::BrokenSymlink { path } => GraphError::BrokenSymlink(path.clone()),
+        GraphProblem::DuplicateContextDocument { id, paths } => {
+            GraphError::DuplicateContextDocument {
+                id: id.clone(),
+                paths: paths.clone(),
+            }
+        }
         GraphProblem::DuplicateCanonicalNode { id, paths } => GraphError::DuplicateCanonicalNode {
             id: id.clone(),
             paths: paths.clone(),
         },
+        GraphProblem::InvalidContextMarkdown { path, reason } => {
+            GraphError::InvalidContextMarkdown {
+                path: path.clone(),
+                reason: reason.clone(),
+            }
+        }
         GraphProblem::MissingNodeMarkdown { path } => GraphError::MissingNodeMarkdown(path.clone()),
         GraphProblem::MissingChildrenDirectory { path } => {
             GraphError::MissingChildrenDirectory(path.clone())
@@ -538,7 +809,10 @@ fn problem_is_directly_under_container(problem: &GraphProblem, container: &Path)
         | GraphProblem::MissingChildrenDirectory { path } => {
             problem_entry_path(path).parent() == Some(container)
         }
-        GraphProblem::DuplicateCanonicalNode { .. } | GraphProblem::CycleDetected { .. } => false,
+        GraphProblem::DuplicateCanonicalNode { .. }
+        | GraphProblem::DuplicateContextDocument { .. }
+        | GraphProblem::InvalidContextMarkdown { .. }
+        | GraphProblem::CycleDetected { .. } => false,
     }
 }
 
@@ -583,6 +857,7 @@ mod tests {
     #[test]
     fn spec_13_and_24_cycle_detection_records_manual_cycles() {
         let mut result = ScanResult {
+            contexts: BTreeMap::new(),
             nodes: BTreeMap::from([
                 (A_ID.to_string(), scanned(A_ID, "Alpha", "/graph/roots/a")),
                 (
@@ -619,6 +894,7 @@ mod tests {
     #[test]
     fn spec_19_graph_index_sorts_nodes_and_edges_for_deterministic_discovery() {
         let result = ScanResult {
+            contexts: BTreeMap::new(),
             nodes: BTreeMap::from([
                 (B_ID.to_string(), scanned(B_ID, "Beta", "/graph/roots/b")),
                 (A_ID.to_string(), scanned(A_ID, "Alpha", "/graph/roots/a")),
@@ -661,5 +937,59 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(A_ID, B_ID), (B_ID, C_ID)]
         );
+    }
+
+    #[test]
+    fn spec_19_graph_index_sorts_contexts_and_keeps_context_problems() {
+        let mut result = ScanResult {
+            contexts: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            edges: Vec::new(),
+            root_entries: Vec::new(),
+            broken_symlinks: Vec::new(),
+            problems: vec![GraphProblem::InvalidContextMarkdown {
+                path: PathBuf::from("/graph/context/bad.md"),
+                reason: "bad".to_string(),
+            }],
+        };
+        result.contexts.insert(
+            B_ID.to_string(),
+            ScannedContext {
+                id: B_ID.to_string(),
+                title: "Beta".to_string(),
+                filename: format!("beta--{B_ID}.md"),
+                markdown: String::new(),
+                created_at_unix: 1,
+                updated_at_unix: 1,
+                paths: vec![PathBuf::from(format!("/graph/context/beta--{B_ID}.md"))],
+            },
+        );
+        result.contexts.insert(
+            A_ID.to_string(),
+            ScannedContext {
+                id: A_ID.to_string(),
+                title: "Alpha".to_string(),
+                filename: format!("alpha--{A_ID}.md"),
+                markdown: String::new(),
+                created_at_unix: 1,
+                updated_at_unix: 1,
+                paths: vec![PathBuf::from(format!("/graph/context/alpha--{A_ID}.md"))],
+            },
+        );
+
+        let index = graph_index(&result);
+
+        assert_eq!(
+            index
+                .contexts
+                .iter()
+                .map(|context| context.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![A_ID, B_ID]
+        );
+        assert!(matches!(
+            index.problems[0],
+            GraphProblem::InvalidContextMarkdown { .. }
+        ));
     }
 }

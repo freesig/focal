@@ -13,13 +13,15 @@ mod scan;
 
 pub use error::{Error, GraphError};
 pub use model::{
-    DeleteMode, GraphEdge, GraphIndex, GraphProblem, IdeaGraph, NewNode, Node, NodeContent, NodeId,
+    ContextDocument, ContextDocumentPatch, ContextId, ContextSummary, DeleteMode, GraphEdge,
+    GraphIndex, GraphProblem, IdeaGraph, NewContextDocument, NewNode, Node, NodeContent, NodeId,
     NodeKind, NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
 };
 pub use ops::{
-    add_child_node, add_root_node, delete_node, init_graph, link_existing_node, list_ancestors,
-    list_children, list_descendants, list_parents, list_roots, open_graph, read_node,
-    rebuild_index, unlink_child, update_node,
+    add_child_node, add_context_document, add_root_node, delete_context_document, delete_node,
+    init_graph, link_existing_node, list_ancestors, list_children, list_context_documents,
+    list_descendants, list_parents, list_roots, open_graph, read_context_document, read_node,
+    rebuild_index, unlink_child, update_context_document, update_node,
 };
 
 #[cfg(test)]

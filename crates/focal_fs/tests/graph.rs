@@ -2,10 +2,12 @@ use std::fs;
 use std::path::Path;
 
 use focal_fs::{
-    DeleteMode, GraphError, GraphProblem, NewNode, NodeContent, NodeKind, NodePatch, OrphanPolicy,
-    TraversalOptions, add_child_node, add_root_node, delete_node, init_graph, link_existing_node,
-    list_ancestors, list_children, list_descendants, list_parents, list_roots, open_graph,
-    read_node, rebuild_index, unlink_child, update_node,
+    ContextDocumentPatch, DeleteMode, GraphError, GraphProblem, NewContextDocument, NewNode,
+    NodeContent, NodeKind, NodePatch, OrphanPolicy, TraversalOptions, add_child_node,
+    add_context_document, add_root_node, delete_context_document, delete_node, init_graph,
+    link_existing_node, list_ancestors, list_children, list_context_documents, list_descendants,
+    list_parents, list_roots, open_graph, read_context_document, read_node, rebuild_index,
+    unlink_child, update_context_document, update_node,
 };
 use tempfile::tempdir;
 
@@ -47,6 +49,7 @@ fn init_open_add_read_and_update_nodes() {
     let graph = init_graph(&graph_path).unwrap();
 
     assert!(graph_path.join("roots").is_dir());
+    assert!(graph_path.join("context").is_dir());
     open_graph(&graph_path).unwrap();
     assert!(matches!(
         open_graph(temp.path().join("not-a-graph")),
@@ -98,6 +101,204 @@ fn init_open_add_read_and_update_nodes() {
     let markdown = fs::read_to_string(updated.canonical_path.join("node.md")).unwrap();
     assert!(markdown.contains("title: A better title"));
     assert!(!markdown.contains("# A better title"));
+}
+
+#[test]
+fn context_directory_is_created_and_open_auto_creates_missing_directory() {
+    let temp = tempdir().unwrap();
+    let graph_path = temp.path().join("ideas");
+    init_graph(&graph_path).unwrap();
+    let context_dir = graph_path.join("context");
+
+    assert!(context_dir.is_dir());
+    fs::remove_dir_all(&context_dir).unwrap();
+
+    let graph = open_graph(&graph_path).unwrap();
+    assert!(context_dir.is_dir());
+    assert!(list_context_documents(&graph).unwrap().is_empty());
+
+    fs::remove_dir_all(&context_dir).unwrap();
+    fs::write(&context_dir, "not a directory").unwrap();
+    assert!(matches!(
+        open_graph(&graph_path),
+        Err(GraphError::InvalidGraphRoot(_))
+    ));
+}
+
+#[test]
+fn context_documents_crud_list_sort_and_preserve_stable_filename() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let root = add_root_node(&graph, statement("Root", "node body")).unwrap();
+
+    let beta = add_context_document(
+        &graph,
+        NewContextDocument {
+            title: "Beta notes".to_string(),
+            markdown: "# Human heading\n\nBeta body".to_string(),
+        },
+    )
+    .unwrap();
+    let alpha = add_context_document(
+        &graph,
+        NewContextDocument {
+            title: "Alpha notes".to_string(),
+            markdown: String::new(),
+        },
+    )
+    .unwrap();
+    assert_uuid_shape(&beta);
+    assert_uuid_shape(&alpha);
+
+    let listed = list_context_documents(&graph).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|context| context.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![alpha.as_str(), beta.as_str()]
+    );
+    assert_eq!(
+        listed[0].path.parent().and_then(Path::file_name),
+        Some(std::ffi::OsStr::new("context"))
+    );
+    assert!(
+        listed[0]
+            .filename
+            .ends_with(format!("--{alpha}.md").as_str())
+    );
+
+    let before = read_context_document(&graph, &beta).unwrap();
+    assert_eq!(before.markdown, "# Human heading\n\nBeta body");
+    assert!(before.path.is_file());
+    let original_path = before.path.clone();
+    let original_filename = before.filename.clone();
+
+    let updated = update_context_document(
+        &graph,
+        &beta,
+        ContextDocumentPatch {
+            title: Some("Renamed context".to_string()),
+            markdown: Some("Updated body".to_string()),
+        },
+    )
+    .unwrap();
+    assert_eq!(updated.id, beta);
+    assert_eq!(updated.filename, original_filename);
+    assert_eq!(updated.path, original_path);
+    assert!(updated.updated_at_unix > before.updated_at_unix);
+    assert_eq!(updated.markdown, "Updated body");
+    let persisted = fs::read_to_string(&updated.path).unwrap();
+    assert!(persisted.contains("title: Renamed context"));
+    assert!(!persisted.contains("# Renamed context"));
+
+    let index = rebuild_index(&graph).unwrap();
+    assert_eq!(index.contexts.len(), 2);
+
+    delete_context_document(&graph, &beta).unwrap();
+    assert!(matches!(
+        read_context_document(&graph, &beta),
+        Err(GraphError::ContextNotFound(id)) if id == beta
+    ));
+    assert!(read_node(&graph, &root).is_ok());
+    assert_eq!(list_roots(&graph).unwrap()[0].id, root);
+}
+
+#[test]
+fn context_documents_reject_invalid_inputs_and_report_corrupt_files() {
+    let temp = tempdir().unwrap();
+    let graph = init_graph(temp.path()).unwrap();
+    let valid = add_context_document(
+        &graph,
+        NewContextDocument {
+            title: "Valid".to_string(),
+            markdown: "Body".to_string(),
+        },
+    )
+    .unwrap();
+    let valid_doc = read_context_document(&graph, &valid).unwrap();
+
+    assert!(matches!(
+        add_context_document(
+            &graph,
+            NewContextDocument {
+                title: " \n\t ".to_string(),
+                markdown: String::new(),
+            },
+        ),
+        Err(GraphError::InvalidTitle)
+    ));
+    assert!(matches!(
+        read_context_document(&graph, "../not-an-id"),
+        Err(GraphError::InvalidContextId(_))
+    ));
+
+    let duplicate_path = temp
+        .path()
+        .join("context")
+        .join(format!("duplicate--{valid}.md"));
+    fs::copy(&valid_doc.path, &duplicate_path).unwrap();
+    assert!(matches!(
+        read_context_document(&graph, &valid),
+        Err(GraphError::DuplicateContextDocument { id, paths }) if id == valid && paths.len() == 2
+    ));
+    assert!(matches!(
+        list_context_documents(&graph),
+        Err(GraphError::DuplicateContextDocument { id, .. }) if id == valid
+    ));
+    fs::remove_file(&duplicate_path).unwrap();
+
+    let bad_id = "550e8400-e29b-41d4-a716-446655440000";
+    let bad_path = temp
+        .path()
+        .join("context")
+        .join(format!("bad--{bad_id}.md"));
+    fs::write(&bad_path, "not front matter").unwrap();
+    assert!(
+        rebuild_index(&graph)
+            .unwrap()
+            .problems
+            .iter()
+            .any(|problem| matches!(
+                problem,
+                GraphProblem::InvalidContextMarkdown { path, .. }
+                    if path.file_name() == bad_path.file_name()
+            ))
+    );
+    assert!(matches!(
+        list_context_documents(&graph),
+        Err(GraphError::InvalidContextMarkdown { path, .. })
+            if path.file_name() == bad_path.file_name()
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn context_directory_and_files_do_not_follow_symlinks() {
+    let graph_temp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let graph = init_graph(graph_temp.path()).unwrap();
+    let context_dir = graph_temp.path().join("context");
+    let outside_file = outside.path().join("outside.md");
+    let link_path = context_dir.join("outside--550e8400-e29b-41d4-a716-446655440000.md");
+
+    fs::write(&outside_file, "secret").unwrap();
+    std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+
+    assert!(matches!(
+        list_context_documents(&graph),
+        Err(GraphError::InvalidContextMarkdown { path, .. })
+            if path.file_name() == link_path.file_name()
+    ));
+
+    fs::remove_file(&link_path).unwrap();
+    fs::remove_dir_all(&context_dir).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &context_dir).unwrap();
+
+    assert!(matches!(
+        open_graph(graph_temp.path()),
+        Err(GraphError::InvalidGraphRoot(_))
+    ));
 }
 
 #[test]

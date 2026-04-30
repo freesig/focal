@@ -13,6 +13,15 @@ pub(crate) struct ParsedMarkdown {
     pub updated_at_unix: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedContextMarkdown {
+    pub id: String,
+    pub title: String,
+    pub markdown: String,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+}
+
 pub(crate) fn parse_node_markdown(path: &Path, source: &str) -> Result<ParsedMarkdown, String> {
     let (metadata, body) = split_front_matter(source)?;
     let id = required_field(&metadata, "id")?.to_string();
@@ -45,6 +54,22 @@ pub(crate) fn parse_node_markdown(path: &Path, source: &str) -> Result<ParsedMar
     })
 }
 
+pub(crate) fn parse_context_markdown(source: &str) -> Result<ParsedContextMarkdown, String> {
+    let (metadata, body) = split_front_matter(source)?;
+    let id = required_field(&metadata, "id")?.to_string();
+    let title = required_field(&metadata, "title")?.to_string();
+    let created_at_unix = parse_unix(required_field(&metadata, "created_at_unix")?)?;
+    let updated_at_unix = parse_unix(required_field(&metadata, "updated_at_unix")?)?;
+
+    Ok(ParsedContextMarkdown {
+        id,
+        title,
+        markdown: body.to_string(),
+        created_at_unix,
+        updated_at_unix,
+    })
+}
+
 pub(crate) fn render_node_markdown(
     id: &str,
     kind: &NodeKind,
@@ -70,6 +95,18 @@ pub(crate) fn render_node_markdown(
 
     format!(
         "---\nid: {id}\nkind: {kind_value}\ntitle: {title}\ncreated_at_unix: {created_at_unix}\nupdated_at_unix: {updated_at_unix}\n---\n\n{body}"
+    )
+}
+
+pub(crate) fn render_context_markdown(
+    id: &str,
+    title: &str,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    markdown: &str,
+) -> String {
+    format!(
+        "---\nid: {id}\ntitle: {title}\ncreated_at_unix: {created_at_unix}\nupdated_at_unix: {updated_at_unix}\n---\n\n{markdown}"
     )
 }
 
@@ -300,6 +337,40 @@ mod tests {
         assert_eq!(
             parse_node_markdown(Path::new("node.md"), &invalid_timestamp).unwrap_err(),
             "invalid unix timestamp `now`"
+        );
+    }
+
+    #[test]
+    fn spec_08_context_markdown_round_trips_without_heading_management() {
+        let id = "7a736f79-bf3f-4d1e-8bd8-71fd9b94a2d4";
+        let markdown = "# Human heading\n\nRaw notes\n";
+
+        let rendered = render_context_markdown(id, "Raw planning notes", 10, 11, markdown);
+
+        assert!(rendered.starts_with(
+            "---\nid: 7a736f79-bf3f-4d1e-8bd8-71fd9b94a2d4\ntitle: Raw planning notes\ncreated_at_unix: 10\nupdated_at_unix: 11\n---\n\n"
+        ));
+        assert!(rendered.contains("# Human heading"));
+
+        let parsed = parse_context_markdown(&rendered).unwrap();
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.title, "Raw planning notes");
+        assert_eq!(parsed.markdown, markdown);
+        assert_eq!(parsed.created_at_unix, 10);
+        assert_eq!(parsed.updated_at_unix, 11);
+    }
+
+    #[test]
+    fn spec_08_context_markdown_allows_empty_body_and_requires_metadata() {
+        let id = "7a736f79-bf3f-4d1e-8bd8-71fd9b94a2d4";
+        let rendered = render_context_markdown(id, "Empty", 1, 1, "");
+
+        let parsed = parse_context_markdown(&rendered).unwrap();
+        assert_eq!(parsed.markdown, "");
+        assert_eq!(
+            parse_context_markdown("---\nid: bad\ncreated_at_unix: 1\nupdated_at_unix: 1\n---\n")
+                .unwrap_err(),
+            "missing metadata field `title`"
         );
     }
 }

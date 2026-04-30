@@ -12,8 +12,9 @@ use std::path::Path;
 use rusqlite::Connection;
 
 pub use focal_types::{
-    DeleteMode, GraphEdge, GraphError, GraphIndex, GraphProblem, NewNode, Node, NodeContent,
-    NodeId, NodeKind, NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
+    ContextDocument, ContextDocumentPatch, ContextId, ContextSummary, DeleteMode, GraphEdge,
+    GraphError, GraphIndex, GraphProblem, NewContextDocument, NewNode, Node, NodeContent, NodeId,
+    NodeKind, NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
 };
 
 pub enum Backend<'conn> {
@@ -147,6 +148,78 @@ pub fn disabled_sqlite(graph_name: impl Into<String>) -> Backend<'static> {
         graph_name: graph_name.into(),
         _lifetime: PhantomData,
     })
+}
+
+pub fn add_context_document(
+    backend: &mut Backend<'_>,
+    context: NewContextDocument,
+) -> Result<ContextId, Error> {
+    match backend {
+        Backend::Fs(graph) => focal_fs::add_context_document(graph, context).map_err(fs_error),
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite(graph) => {
+            focal_sqlite::add_context_document(graph, context).map_err(sqlite_error)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite(sqlite) => Err(disabled_sqlite_error(sqlite)),
+    }
+}
+
+pub fn read_context_document(
+    backend: &Backend<'_>,
+    context_id: &str,
+) -> Result<ContextDocument, Error> {
+    match backend {
+        Backend::Fs(graph) => focal_fs::read_context_document(graph, context_id).map_err(fs_error),
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite(graph) => {
+            focal_sqlite::read_context_document(graph, context_id).map_err(sqlite_error)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite(sqlite) => Err(disabled_sqlite_error(sqlite)),
+    }
+}
+
+pub fn update_context_document(
+    backend: &mut Backend<'_>,
+    context_id: &str,
+    patch: ContextDocumentPatch,
+) -> Result<ContextDocument, Error> {
+    match backend {
+        Backend::Fs(graph) => {
+            focal_fs::update_context_document(graph, context_id, patch).map_err(fs_error)
+        }
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite(graph) => {
+            focal_sqlite::update_context_document(graph, context_id, patch).map_err(sqlite_error)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite(sqlite) => Err(disabled_sqlite_error(sqlite)),
+    }
+}
+
+pub fn delete_context_document(backend: &mut Backend<'_>, context_id: &str) -> Result<(), Error> {
+    match backend {
+        Backend::Fs(graph) => {
+            focal_fs::delete_context_document(graph, context_id).map_err(fs_error)
+        }
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite(graph) => {
+            focal_sqlite::delete_context_document(graph, context_id).map_err(sqlite_error)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite(sqlite) => Err(disabled_sqlite_error(sqlite)),
+    }
+}
+
+pub fn list_context_documents(backend: &Backend<'_>) -> Result<Vec<ContextSummary>, Error> {
+    match backend {
+        Backend::Fs(graph) => focal_fs::list_context_documents(graph).map_err(fs_error),
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite(graph) => focal_sqlite::list_context_documents(graph).map_err(sqlite_error),
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite(sqlite) => Err(disabled_sqlite_error(sqlite)),
+    }
 }
 
 pub fn add_root_node(backend: &mut Backend<'_>, node: NewNode) -> Result<NodeId, Error> {

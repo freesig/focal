@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use focal_types::{
-    DeleteMode, GraphEdge, GraphError, GraphIndex, GraphProblem, NewNode, Node, NodeContent,
-    NodeId, NodeKind, NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
+    ContextDocument, ContextDocumentPatch, ContextId, ContextSummary, DeleteMode, GraphEdge,
+    GraphError, GraphIndex, GraphProblem, NewContextDocument, NewNode, Node, NodeContent, NodeId,
+    NodeKind, NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -75,6 +76,20 @@ CREATE TABLE IF NOT EXISTS focal_nodes (
     created_at_unix INTEGER NOT NULL,
     updated_at_unix INTEGER NOT NULL,
     PRIMARY KEY (graph_id, id),
+    FOREIGN KEY (graph_id) REFERENCES focal_graphs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS focal_context_documents (
+    graph_id INTEGER NOT NULL,
+    id TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    title TEXT NOT NULL,
+    markdown TEXT NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    updated_at_unix INTEGER NOT NULL,
+    PRIMARY KEY (graph_id, id),
+    UNIQUE (graph_id, filename),
     FOREIGN KEY (graph_id) REFERENCES focal_graphs(id) ON DELETE CASCADE
 );
 
@@ -161,6 +176,121 @@ pub fn open_graph<'conn>(
         connection,
         graph_name: graph_name.to_string(),
     })
+}
+
+pub fn add_context_document(
+    graph: &mut IdeaGraph<'_>,
+    context: NewContextDocument,
+) -> Result<ContextId, GraphError> {
+    validate_graph_name(&graph.graph_name)?;
+    validate_new_context_document(&context)?;
+    let graph_name = graph.graph_name.clone();
+    let tx = graph
+        .connection_mut()
+        .transaction()
+        .map_err(storage_error)?;
+    let graph_id = require_graph_id(&tx, &graph_name)?;
+    let id = generate_unique_context_id(&tx, graph_id)?;
+    let (slug, filename) = unique_context_filename(&tx, graph_id, &context.title, &id)?;
+    let now = now_unix();
+    insert_context_document(&tx, graph_id, &id, &slug, &filename, &context, now, now)?;
+    tx.commit().map_err(storage_error)?;
+    Ok(id)
+}
+
+pub fn read_context_document(
+    graph: &IdeaGraph<'_>,
+    context_id: &str,
+) -> Result<ContextDocument, GraphError> {
+    validate_context_id(context_id)?;
+    let graph_id = graph_id_for_graph(graph)?;
+    let context_scan = load_context_scan(graph.connection(), graph_id)?;
+    let context = require_context(&context_scan, context_id)?;
+    Ok(context_document_from_scanned(context))
+}
+
+pub fn update_context_document(
+    graph: &mut IdeaGraph<'_>,
+    context_id: &str,
+    patch: ContextDocumentPatch,
+) -> Result<ContextDocument, GraphError> {
+    validate_context_id(context_id)?;
+    let graph_name = graph.graph_name.clone();
+    let tx = graph
+        .connection_mut()
+        .transaction()
+        .map_err(storage_error)?;
+    let graph_id = require_graph_id(&tx, &graph_name)?;
+    let context_scan = load_context_scan(&tx, graph_id)?;
+    let context = require_context(&context_scan, context_id)?;
+    let title = match patch.title {
+        Some(title) => {
+            validate_title(&title)?;
+            title
+        }
+        None => context.title.clone(),
+    };
+    let markdown = patch.markdown.unwrap_or_else(|| context.markdown.clone());
+    let updated_at_unix = now_unix().max(context.updated_at_unix.saturating_add(1));
+    update_context_row(
+        &tx,
+        graph_id,
+        context_id,
+        &title,
+        &markdown,
+        updated_at_unix,
+    )?;
+    let updated = ContextDocument {
+        id: context.id.clone(),
+        title,
+        filename: context.filename.clone(),
+        markdown,
+        created_at_unix: context.created_at_unix,
+        updated_at_unix,
+        path: context.path.clone(),
+    };
+    tx.commit().map_err(storage_error)?;
+    Ok(updated)
+}
+
+pub fn delete_context_document(
+    graph: &mut IdeaGraph<'_>,
+    context_id: &str,
+) -> Result<(), GraphError> {
+    validate_context_id(context_id)?;
+    let graph_name = graph.graph_name.clone();
+    let tx = graph
+        .connection_mut()
+        .transaction()
+        .map_err(storage_error)?;
+    let graph_id = require_graph_id(&tx, &graph_name)?;
+    let context_scan = load_context_scan(&tx, graph_id)?;
+    require_context(&context_scan, context_id)?;
+    let rows = tx
+        .execute(
+            "DELETE FROM focal_context_documents WHERE graph_id = ?1 AND id = ?2",
+            params![graph_id, context_id],
+        )
+        .map_err(storage_error)?;
+    if rows == 0 {
+        return Err(GraphError::ContextNotFound(context_id.to_string()));
+    }
+    tx.commit().map_err(storage_error)
+}
+
+pub fn list_context_documents(graph: &IdeaGraph<'_>) -> Result<Vec<ContextSummary>, GraphError> {
+    let graph_id = graph_id_for_graph(graph)?;
+    let context_scan = load_context_scan(graph.connection(), graph_id)?;
+    if let Some(error) = first_context_problem_error(&context_scan) {
+        return Err(error);
+    }
+    let mut summaries = context_scan
+        .contexts
+        .values()
+        .map(context_summary_from_scanned)
+        .collect::<Vec<_>>();
+    sort_context_summaries(&mut summaries);
+    Ok(summaries)
 }
 
 pub fn add_root_node(graph: &mut IdeaGraph<'_>, node: NewNode) -> Result<NodeId, GraphError> {
@@ -498,6 +628,17 @@ pub fn rebuild_index(graph: &IdeaGraph<'_>) -> Result<GraphIndex, GraphError> {
 }
 
 #[derive(Debug, Clone)]
+struct ScannedContext {
+    id: String,
+    title: String,
+    filename: String,
+    markdown: String,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 struct ScannedNode {
     id: String,
     kind: NodeKind,
@@ -529,10 +670,18 @@ struct ScannedPlacement {
 
 #[derive(Debug, Clone)]
 struct ScanResult {
+    contexts: BTreeMap<String, ScannedContext>,
     nodes: BTreeMap<String, ScannedNode>,
     placements: Vec<ScannedPlacement>,
     problems: Vec<GraphProblem>,
     node_problems: BTreeMap<String, GraphProblem>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextScan {
+    contexts: BTreeMap<String, ScannedContext>,
+    problems: Vec<GraphProblem>,
+    context_problems: BTreeMap<String, GraphProblem>,
 }
 
 #[derive(Debug)]
@@ -543,6 +692,17 @@ struct RawNode {
     statement_body: Option<String>,
     qa_question: Option<String>,
     qa_answer: Option<String>,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+}
+
+#[derive(Debug)]
+struct RawContext {
+    id: String,
+    slug: String,
+    filename: String,
+    title: String,
+    markdown: String,
     created_at_unix: i64,
     updated_at_unix: i64,
 }
@@ -558,6 +718,7 @@ struct RawPlacement {
 }
 
 fn load_scan(connection: &Connection, graph_id: i64) -> Result<ScanResult, GraphError> {
+    let context_scan = load_context_scan(connection, graph_id)?;
     let raw_nodes = query_raw_nodes(connection, graph_id)?;
     let raw_placements = query_raw_placements(connection, graph_id)?;
     let raw_node_ids = raw_nodes
@@ -566,9 +727,10 @@ fn load_scan(connection: &Connection, graph_id: i64) -> Result<ScanResult, Graph
         .collect::<BTreeSet<_>>();
 
     let mut result = ScanResult {
+        contexts: context_scan.contexts,
         nodes: BTreeMap::new(),
         placements: Vec::new(),
-        problems: Vec::new(),
+        problems: context_scan.problems,
         node_problems: BTreeMap::new(),
     };
 
@@ -658,6 +820,106 @@ fn load_scan(connection: &Connection, graph_id: i64) -> Result<ScanResult, Graph
     validate_child_paths(&mut result);
     detect_cycles(&mut result);
     Ok(result)
+}
+
+fn load_context_scan(connection: &Connection, graph_id: i64) -> Result<ContextScan, GraphError> {
+    let raw_contexts = query_raw_contexts(connection, graph_id)?;
+    let mut paths_by_id = BTreeMap::<String, Vec<PathBuf>>::new();
+    for raw in &raw_contexts {
+        paths_by_id
+            .entry(raw.id.clone())
+            .or_default()
+            .push(logical_context_path(&raw.filename));
+    }
+    for paths in paths_by_id.values_mut() {
+        paths.sort();
+    }
+
+    let mut result = ContextScan {
+        contexts: BTreeMap::new(),
+        problems: Vec::new(),
+        context_problems: BTreeMap::new(),
+    };
+    let mut seen_contexts = BTreeSet::new();
+    for raw_context in raw_contexts {
+        if !seen_contexts.insert(raw_context.id.clone()) {
+            let paths = paths_by_id
+                .get(&raw_context.id)
+                .cloned()
+                .unwrap_or_else(|| vec![logical_context_path(&raw_context.filename)]);
+            add_context_problem(
+                &mut result,
+                &raw_context.id,
+                GraphProblem::DuplicateContextDocument {
+                    id: raw_context.id.clone(),
+                    paths,
+                },
+            );
+            continue;
+        }
+
+        match scanned_context_from_raw(raw_context) {
+            Ok(context) => {
+                result.contexts.insert(context.id.clone(), context);
+            }
+            Err((id, problem)) => add_context_problem(&mut result, &id, problem),
+        }
+    }
+
+    Ok(result)
+}
+
+fn scanned_context_from_raw(
+    raw_context: RawContext,
+) -> Result<ScannedContext, (String, GraphProblem)> {
+    let id = raw_context.id;
+    let path = logical_context_path(&raw_context.filename);
+    if let Err(error) = validate_context_id(&id) {
+        return Err((
+            id,
+            GraphProblem::InvalidContextMarkdown {
+                path,
+                reason: error.to_string(),
+            },
+        ));
+    }
+    if raw_context.slug.trim().is_empty() || raw_context.slug.chars().any(char::is_control) {
+        return Err((
+            id,
+            GraphProblem::InvalidContextMarkdown {
+                path,
+                reason: "context slug must not be empty or contain control characters".to_string(),
+            },
+        ));
+    }
+    if let Err(reason) = validate_context_filename(&raw_context.filename, &id) {
+        return Err((id, GraphProblem::InvalidContextMarkdown { path, reason }));
+    }
+    if let Err(error) = validate_title(&raw_context.title) {
+        return Err((
+            id,
+            GraphProblem::InvalidContextMarkdown {
+                path,
+                reason: error.to_string(),
+            },
+        ));
+    }
+    let created_at_unix =
+        non_negative_context_unix(raw_context.created_at_unix, &path, "created_at_unix")
+            .map_err(|problem| (id.clone(), problem))?;
+    let updated_at_unix =
+        non_negative_context_unix(raw_context.updated_at_unix, &path, "updated_at_unix")
+            .map_err(|problem| (id.clone(), problem))?;
+
+    Ok(ScannedContext {
+        id,
+        title: raw_context.title,
+        filename: raw_context.filename,
+        markdown: raw_context.markdown,
+        created_at_unix,
+        updated_at_unix,
+        path,
+    })
 }
 
 fn scanned_node_from_raw(
@@ -869,6 +1131,36 @@ fn query_raw_nodes(connection: &Connection, graph_id: i64) -> Result<Vec<RawNode
     Ok(nodes)
 }
 
+fn query_raw_contexts(
+    connection: &Connection,
+    graph_id: i64,
+) -> Result<Vec<RawContext>, GraphError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, slug, filename, title, markdown, created_at_unix, updated_at_unix \
+             FROM focal_context_documents WHERE graph_id = ?1 ORDER BY title, id, filename",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map(params![graph_id], |row| {
+            Ok(RawContext {
+                id: row.get(0)?,
+                slug: row.get(1)?,
+                filename: row.get(2)?,
+                title: row.get(3)?,
+                markdown: row.get(4)?,
+                created_at_unix: row.get(5)?,
+                updated_at_unix: row.get(6)?,
+            })
+        })
+        .map_err(storage_error)?;
+    let mut contexts = Vec::new();
+    for row in rows {
+        contexts.push(row.map_err(storage_error)?);
+    }
+    Ok(contexts)
+}
+
 fn query_raw_placements(
     connection: &Connection,
     graph_id: i64,
@@ -944,6 +1236,14 @@ fn add_node_problem(result: &mut ScanResult, node_id: &str, problem: GraphProble
     result.problems.push(problem);
 }
 
+fn add_context_problem(result: &mut ContextScan, context_id: &str, problem: GraphProblem) {
+    result
+        .context_problems
+        .entry(context_id.to_string())
+        .or_insert_with(|| problem.clone());
+    result.problems.push(problem);
+}
+
 fn graph_id_for_graph(graph: &IdeaGraph<'_>) -> Result<i64, GraphError> {
     validate_graph_name(&graph.graph_name)?;
     require_graph_id(graph.connection(), &graph.graph_name)
@@ -971,7 +1271,12 @@ fn enable_foreign_keys(connection: &Connection) -> Result<(), GraphError> {
 }
 
 fn ensure_schema_exists(connection: &Connection) -> Result<(), GraphError> {
-    for table in ["focal_graphs", "focal_nodes", "focal_placements"] {
+    for table in [
+        "focal_graphs",
+        "focal_nodes",
+        "focal_context_documents",
+        "focal_placements",
+    ] {
         let exists = connection
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1003,6 +1308,20 @@ fn ensure_schema_exists(connection: &Connection) -> Result<(), GraphError> {
             "statement_body",
             "qa_question",
             "qa_answer",
+            "created_at_unix",
+            "updated_at_unix",
+        ],
+    )?;
+    ensure_table_columns(
+        connection,
+        "focal_context_documents",
+        &[
+            "graph_id",
+            "id",
+            "slug",
+            "filename",
+            "title",
+            "markdown",
             "created_at_unix",
             "updated_at_unix",
         ],
@@ -1111,6 +1430,64 @@ fn update_node_row(
     Ok(())
 }
 
+fn insert_context_document(
+    connection: &Connection,
+    graph_id: i64,
+    id: &str,
+    slug: &str,
+    filename: &str,
+    context: &NewContextDocument,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+) -> Result<(), GraphError> {
+    connection
+        .execute(
+            "INSERT INTO focal_context_documents \
+             (graph_id, id, slug, filename, title, markdown, created_at_unix, updated_at_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                graph_id,
+                id,
+                slug,
+                filename,
+                context.title,
+                context.markdown,
+                unix_to_i64(created_at_unix)?,
+                unix_to_i64(updated_at_unix)?,
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn update_context_row(
+    connection: &Connection,
+    graph_id: i64,
+    context_id: &str,
+    title: &str,
+    markdown: &str,
+    updated_at_unix: u64,
+) -> Result<(), GraphError> {
+    let rows = connection
+        .execute(
+            "UPDATE focal_context_documents \
+             SET title = ?1, markdown = ?2, updated_at_unix = ?3 \
+             WHERE graph_id = ?4 AND id = ?5",
+            params![
+                title,
+                markdown,
+                unix_to_i64(updated_at_unix)?,
+                graph_id,
+                context_id,
+            ],
+        )
+        .map_err(storage_error)?;
+    if rows == 0 {
+        return Err(GraphError::ContextNotFound(context_id.to_string()));
+    }
+    Ok(())
+}
+
 fn insert_placement(
     connection: &Connection,
     graph_id: i64,
@@ -1181,6 +1558,60 @@ fn generate_unique_node_id(connection: &Connection, graph_id: i64) -> Result<Str
         if !exists {
             return Ok(id);
         }
+    }
+}
+
+fn generate_unique_context_id(
+    connection: &Connection,
+    graph_id: i64,
+) -> Result<String, GraphError> {
+    loop {
+        let id = Uuid::new_v4().to_string();
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM focal_context_documents WHERE graph_id = ?1 AND id = ?2",
+                params![graph_id, id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .is_some();
+        if !exists {
+            return Ok(id);
+        }
+    }
+}
+
+fn unique_context_filename(
+    connection: &Connection,
+    graph_id: i64,
+    title: &str,
+    context_id: &str,
+) -> Result<(String, String), GraphError> {
+    let base_slug = slugify(title);
+    let mut suffix = 1usize;
+    loop {
+        let slug = if suffix == 1 {
+            base_slug.clone()
+        } else {
+            format!("{base_slug}-{suffix}")
+        };
+        let filename = format!("{slug}--{context_id}.md");
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM focal_context_documents WHERE graph_id = ?1 AND filename = ?2",
+                params![graph_id, filename],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .is_some();
+        if !exists {
+            return Ok((slug, filename));
+        }
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| GraphError::AliasConflict(PathBuf::from("context")))?;
     }
 }
 
@@ -1495,6 +1926,48 @@ fn compute_delete_set(scan: &ScanResult, target_id: &str) -> BTreeSet<String> {
     delete_set
 }
 
+fn require_context<'a>(
+    scan: &'a ContextScan,
+    context_id: &str,
+) -> Result<&'a ScannedContext, GraphError> {
+    validate_context_id(context_id)?;
+    if let Some(problem) = scan.context_problems.get(context_id) {
+        return Err(graph_problem_to_error(problem));
+    }
+    scan.contexts
+        .get(context_id)
+        .ok_or_else(|| GraphError::ContextNotFound(context_id.to_string()))
+}
+
+fn context_document_from_scanned(context: &ScannedContext) -> ContextDocument {
+    ContextDocument {
+        id: context.id.clone(),
+        title: context.title.clone(),
+        filename: context.filename.clone(),
+        markdown: context.markdown.clone(),
+        created_at_unix: context.created_at_unix,
+        updated_at_unix: context.updated_at_unix,
+        path: context.path.clone(),
+    }
+}
+
+fn context_summary_from_scanned(context: &ScannedContext) -> ContextSummary {
+    ContextSummary {
+        id: context.id.clone(),
+        title: context.title.clone(),
+        filename: context.filename.clone(),
+        path: context.path.clone(),
+    }
+}
+
+fn first_context_problem_error(scan: &ContextScan) -> Option<GraphError> {
+    scan.problems.iter().find_map(|problem| match problem {
+        GraphProblem::DuplicateContextDocument { .. }
+        | GraphProblem::InvalidContextMarkdown { .. } => Some(graph_problem_to_error(problem)),
+        _ => None,
+    })
+}
+
 fn canonical_node<'a>(scan: &'a ScanResult, id: &str) -> Result<&'a ScannedNode, GraphError> {
     validate_node_id(id)?;
     let Some(node) = scan.nodes.get(id) else {
@@ -1714,6 +2187,13 @@ fn sorted_neighbors(
 }
 
 fn graph_index(scan: &ScanResult) -> GraphIndex {
+    let mut contexts = scan
+        .contexts
+        .values()
+        .map(context_summary_from_scanned)
+        .collect::<Vec<_>>();
+    sort_context_summaries(&mut contexts);
+
     let mut nodes = scan
         .nodes
         .values()
@@ -1741,10 +2221,20 @@ fn graph_index(scan: &ScanResult) -> GraphIndex {
     });
 
     GraphIndex {
+        contexts,
         nodes,
         edges,
         problems: scan.problems.clone(),
     }
+}
+
+fn sort_context_summaries(summaries: &mut [ContextSummary]) {
+    summaries.sort_by(|left, right| {
+        left.title
+            .cmp(&right.title)
+            .then(left.id.cmp(&right.id))
+            .then(left.path.cmp(&right.path))
+    });
 }
 
 fn sort_summaries(summaries: &mut [NodeSummary]) {
@@ -1830,6 +2320,8 @@ fn graph_problem_node_id(problem: &GraphProblem) -> Option<String> {
         | GraphProblem::InvalidMarkdown { path, .. } => problem_path_node_id(path),
         GraphProblem::DuplicateCanonicalNode { id, .. }
         | GraphProblem::CycleDetected { node_id: id } => Some(id.clone()),
+        GraphProblem::DuplicateContextDocument { .. }
+        | GraphProblem::InvalidContextMarkdown { .. } => None,
     }
 }
 
@@ -1844,10 +2336,22 @@ fn problem_path_node_id(path: &Path) -> Option<String> {
 fn graph_problem_to_error(problem: &GraphProblem) -> GraphError {
     match problem {
         GraphProblem::BrokenSymlink { path } => GraphError::BrokenSymlink(path.clone()),
+        GraphProblem::DuplicateContextDocument { id, paths } => {
+            GraphError::DuplicateContextDocument {
+                id: id.clone(),
+                paths: paths.clone(),
+            }
+        }
         GraphProblem::DuplicateCanonicalNode { id, paths } => GraphError::DuplicateCanonicalNode {
             id: id.clone(),
             paths: paths.clone(),
         },
+        GraphProblem::InvalidContextMarkdown { path, reason } => {
+            GraphError::InvalidContextMarkdown {
+                path: path.clone(),
+                reason: reason.clone(),
+            }
+        }
         GraphProblem::MissingNodeMarkdown { path } => GraphError::MissingNodeMarkdown(path.clone()),
         GraphProblem::MissingChildrenDirectory { path } => {
             GraphError::MissingChildrenDirectory(path.clone())
@@ -1873,6 +2377,10 @@ fn validate_new_node(node: &NewNode, path: &Path) -> Result<(), GraphError> {
     validate_title(&node.title)?;
     validate_content_matches(&node.kind, &node.content, path)?;
     validate_content_values(&node.content, path)
+}
+
+fn validate_new_context_document(context: &NewContextDocument) -> Result<(), GraphError> {
+    validate_title(&context.title)
 }
 
 fn validate_content_matches(
@@ -1904,22 +2412,60 @@ fn validate_content_values(content: &NodeContent, path: &Path) -> Result<(), Gra
 }
 
 fn validate_node_id(id: &str) -> Result<(), GraphError> {
-    let valid_shape = id.len() == 36
-        && id.char_indices().all(|(index, ch)| match index {
-            8 | 13 | 18 | 23 => ch == '-',
-            _ => ch.is_ascii_digit() || ('a'..='f').contains(&ch),
-        });
-
-    if !valid_shape || Uuid::parse_str(id).is_err() {
+    if !is_valid_uuid_id(id) {
         return Err(GraphError::InvalidNodeId(id.to_string()));
     }
 
     Ok(())
 }
 
+fn validate_context_id(id: &str) -> Result<(), GraphError> {
+    if !is_valid_uuid_id(id) {
+        return Err(GraphError::InvalidContextId(id.to_string()));
+    }
+
+    Ok(())
+}
+
+fn is_valid_uuid_id(id: &str) -> bool {
+    let valid_shape = id.len() == 36
+        && id.char_indices().all(|(index, ch)| match index {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_digit() || ('a'..='f').contains(&ch),
+        });
+
+    valid_shape && Uuid::parse_str(id).is_ok()
+}
+
 fn validate_title(title: &str) -> Result<(), GraphError> {
     if title.trim().is_empty() || title.chars().any(char::is_control) {
         return Err(GraphError::InvalidTitle);
+    }
+    Ok(())
+}
+
+fn validate_context_filename(filename: &str, context_id: &str) -> Result<(), String> {
+    if filename.trim().is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.chars().any(char::is_control)
+    {
+        return Err("context filename must be a single safe path component".to_string());
+    }
+    if filename == "." || filename == ".." {
+        return Err("context filename must be a single safe path component".to_string());
+    }
+    let Some(stem) = filename.strip_suffix(".md") else {
+        return Err("context filename must end with `.md`".to_string());
+    };
+    let Some((_, suffix)) = stem.rsplit_once("--") else {
+        return Err("context filename must end with `--<context-id>.md`".to_string());
+    };
+    if validate_context_id(suffix).is_err() {
+        return Err("context filename must end with `--<context-id>.md`".to_string());
+    }
+    if suffix != context_id {
+        return Err("context filename id suffix does not match context id".to_string());
     }
     Ok(())
 }
@@ -1950,6 +2496,16 @@ fn validate_logical_path(path: &str, node_id: &str) -> Result<(), String> {
 fn non_negative_unix(value: i64, path: &Path, field: &str) -> Result<u64, GraphProblem> {
     if value < 0 {
         return Err(GraphProblem::InvalidMarkdown {
+            path: path.to_path_buf(),
+            reason: format!("{field} must not be negative"),
+        });
+    }
+    Ok(value as u64)
+}
+
+fn non_negative_context_unix(value: i64, path: &Path, field: &str) -> Result<u64, GraphProblem> {
+    if value < 0 {
+        return Err(GraphProblem::InvalidContextMarkdown {
             path: path.to_path_buf(),
             reason: format!("{field} must not be negative"),
         });
@@ -2003,6 +2559,10 @@ fn node_id_from_logical_path(path: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn logical_context_path(filename: &str) -> PathBuf {
+    PathBuf::from("context").join(filename)
 }
 
 fn path_after_subtree_move(path: &str, old_subtree_path: &str, new_subtree_path: &str) -> String {

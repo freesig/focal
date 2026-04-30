@@ -1,6 +1,6 @@
 use focal_core::{
-    self as core, DeleteMode, Error, GraphError, NewNode, NodeContent, NodeKind, NodePatch,
-    OrphanPolicy, TraversalOptions,
+    self as core, ContextDocumentPatch, DeleteMode, Error, GraphError, NewContextDocument, NewNode,
+    NodeContent, NodeKind, NodePatch, OrphanPolicy, TraversalOptions,
 };
 use tempfile::tempdir;
 
@@ -79,6 +79,43 @@ fn fs_backend_dispatches_shared_operations() {
     assert!(matches!(
         core::read_node(&backend, &root),
         Err(Error::Fs(error)) if matches!(error.as_graph_error(), GraphError::NodeNotFound(_))
+    ));
+}
+
+#[test]
+fn fs_backend_dispatches_context_operations() {
+    let temp = tempdir().unwrap();
+    let mut backend = core::init_fs(temp.path()).unwrap();
+
+    let id = core::add_context_document(
+        &mut backend,
+        NewContextDocument {
+            title: "Raw notes".to_string(),
+            markdown: "Body".to_string(),
+        },
+    )
+    .unwrap();
+    let before = core::read_context_document(&backend, &id).unwrap();
+    let updated = core::update_context_document(
+        &mut backend,
+        &id,
+        ContextDocumentPatch {
+            title: Some("Renamed".to_string()),
+            markdown: Some(String::new()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(updated.id, id);
+    assert_eq!(updated.filename, before.filename);
+    assert_eq!(core::list_context_documents(&backend).unwrap().len(), 1);
+    assert_eq!(core::rebuild_index(&backend).unwrap().contexts.len(), 1);
+
+    core::delete_context_document(&mut backend, &id).unwrap();
+    assert!(matches!(
+        core::read_context_document(&backend, &id),
+        Err(Error::Fs(error))
+            if matches!(error.as_graph_error(), GraphError::ContextNotFound(missing) if missing == &id)
     ));
 }
 

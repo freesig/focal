@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 pub use focal_types::{
-    DeleteMode, GraphEdge, GraphIndex, GraphProblem, NewNode, Node, NodeContent, NodeId, NodeKind,
+    ContextDocument, ContextDocumentPatch, ContextId, ContextSummary, DeleteMode, GraphEdge,
+    GraphIndex, GraphProblem, NewContextDocument, NewNode, Node, NodeContent, NodeId, NodeKind,
     NodePatch, NodeSummary, OrphanPolicy, TraversalOptions,
 };
 
@@ -88,6 +89,7 @@ mod tests {
             path: PathBuf::from("roots/parent/children/missing"),
         };
         let index = GraphIndex {
+            contexts: Vec::new(),
             nodes: Vec::new(),
             edges: vec![edge.clone()],
             problems: vec![problem.clone()],
