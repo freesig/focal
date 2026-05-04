@@ -17,7 +17,9 @@ A shared `focal-types` crate contains the common public data types used by both 
 
 A `focal-core` crate provides the unified public API for applications that want to choose a storage backend at runtime without writing backend-specific dispatch code.
 
-Each implementation should be understandable and usable from other Rust applications without requiring a CLI or web server in the consuming application. `focal-fs` should remain dependency-light and should not require a daemon, database, or async runtime. `focal-sqlite` should use a caller-provided `rusqlite::Connection`.
+A `focal-mcp` crate exposes the same unified graph behavior over the Model Context Protocol (MCP) so AI agents can inspect and modify a configured focal graph through tool calls and readable resources.
+
+Each storage and core implementation should be understandable and usable from other Rust applications without requiring a CLI or web server in the consuming application. `focal-fs` should remain dependency-light and should not require a daemon, database, or async runtime. `focal-sqlite` should use a caller-provided `rusqlite::Connection`. `focal-mcp` is the agent-facing integration layer and may provide a server executable because MCP stdio servers are launched as subprocesses by clients.
 
 ## 2. Goals
 
@@ -32,6 +34,7 @@ Each implementation should be understandable and usable from other Rust applicat
 - For `focal-sqlite`, store nodes, content, and edges in SQLite while preserving the same graph behavior as `focal-fs`.
 - For `focal-sqlite`, store original idea context documents in SQLite rows scoped to the graph namespace.
 - Provide a `focal-core` crate whose free-function API dispatches to `focal-fs` and, when the `sqlite` feature is enabled, `focal-sqlite` through a concrete `Backend` enum.
+- Provide a `focal-mcp` crate that wraps `focal-core` and exposes every shared graph operation as MCP tools and read-only graph views as MCP resources.
 - Support statement nodes and question-answer nodes.
 - Support optional alternative answers on question-answer nodes, ordered by likelihood after the primary answer.
 - Support marking and unmarking nodes as reviewed through node metadata.
@@ -46,11 +49,14 @@ Each implementation should be understandable and usable from other Rust applicat
 
 - No database backend for `focal-fs`.
 - No network service for `focal-fs`.
-- No required CLI.
+- No required CLI for `focal-fs`, `focal-sqlite`, or `focal-core`.
 - No additional storage engine inside `focal-core`; it is only a dispatch facade over storage crates.
+- No additional storage engine inside `focal-mcp`; it is only an MCP adapter over `focal-core`.
 - No rich Markdown rendering.
 - No collaborative multi-writer synchronization.
 - No automatic semantic analysis of ideas.
+- No automatic agent planning, ranking, rewriting, or semantic graph generation inside `focal-mcp`; agents decide what operations to call.
+- No default network listener for `focal-mcp`; stdio is the required first transport, and any HTTP transport must be opt-in.
 - No support for arbitrary graph cycles in the first version.
 - No requirement for `focal-sqlite` to support manual filesystem edits, symlink repair, or arbitrary SQL access by callers.
 - No node-level provenance links from original idea context documents to generated nodes in the first version.
@@ -62,6 +68,10 @@ Each implementation should be understandable and usable from other Rust applicat
 - **Unified backend**: The `focal-core::Backend` enum value used by callers that want the same API over either `focal-fs` or `focal-sqlite`.
 - **Graph root**: For `focal-fs`, the root directory containing the whole idea graph.
 - **SQLite graph**: For `focal-sqlite`, a named graph namespace stored in tables inside a shared SQLite database and opened through a borrowed `rusqlite::Connection`.
+- **MCP server**: For `focal-mcp`, a process or library entry point that speaks MCP and exposes a configured focal graph to an AI client.
+- **MCP tool**: An agent-callable operation exposed by `focal-mcp`. Each graph-mutating or graph-reading MCP tool must map to one `focal-core` operation.
+- **MCP resource**: A read-only, URI-addressable graph view exposed by `focal-mcp` for clients that want context without invoking a tool.
+- **Focal MCP URI**: A `focal://` URI exposed by `focal-mcp` for graph, node, context document, and traversal resources.
 - **Original idea context**: Messy graph-level Markdown material that helped generate or evolve the graph, stored separately from nodes.
 - **Context document**: One editable original idea context Markdown document. Context documents are graph-level records and are not linked to individual nodes in the first version.
 - **Context directory**: For `focal-fs`, the top-level `<graph-root>/context/` directory containing context Markdown files.
@@ -433,6 +443,8 @@ pub struct ContextSummary {
 ```
 
 The implementation may add private fields, but public types should stay small and easy to construct in tests.
+
+`focal-mcp` must expose JSON-serializable request and response shapes for every public `focal-core` type used by MCP tools or resources. It may do this by deriving serialization on the shared `focal-types` types or by defining crate-local DTOs that round-trip without losing information. MCP JSON field names should mirror the Rust public field names, and enum values should use stable lowercase strings such as `statement`, `qa`, `recursive`, and `move_to_roots`.
 
 For `NodeContent::QuestionAnswer`, `alternative_answers` stores caller-provided alternatives that are intended to be non-primary. The primary answer is stored only in `answer`, and the library does not compare or deduplicate alternative answers against the primary answer. An empty `alternative_answers` vector represents a valid question-answer node with no alternatives.
 
@@ -1464,6 +1476,19 @@ Unified core API:
 - Verify missing context documents, nodes, parents, children, and placements are returned as errors, not panics or public `Option` values.
 - Verify public `focal-core` code paths do not use `unwrap`, `expect`, `panic!`, `todo!`, or `unimplemented!` for recoverable backend states.
 
+MCP API:
+
+- Start a `focal-mcp` stdio server against a filesystem graph.
+- With the `sqlite` feature enabled, start a `focal-mcp` server against a SQLite graph namespace.
+- Verify MCP capability negotiation advertises tools and resources.
+- Verify `tools/list` exposes every required `focal_` tool with JSON schemas.
+- Verify graph-reading MCP tools return the same data as the matching `focal-core` read, list, traversal, or validation operation.
+- Verify mutating MCP tools perform the same add, update, link, unlink, delete, review, context document, and promotion behavior as `focal-core`.
+- Verify MCP tool execution errors preserve backend error kind and useful graph context.
+- Verify MCP resources and resource templates expose graph index, roots, node, traversal, context summary, and context document views.
+- Verify `focal://` resource reads return the same data as corresponding MCP tools and core functions.
+- Verify stdio logs are written to stderr and stdout contains only MCP JSON-RPC messages.
+
 ## `focal-core` Unified API Crate
 
 The workspace should include a `focal-core` crate, with Rust library name `focal_core`, that provides the unified free-function API described in Section 10.
@@ -1491,6 +1516,192 @@ The crate must not:
 - Require callers to use traits, trait objects, async tasks, a CLI, or a daemon.
 - Convert recoverable missing-value states into panics.
 - Return public `Option` values for graph operations that can report absence with `focal_core::Error`.
+
+## `focal-mcp` MCP Server Crate
+
+The workspace should include a `focal-mcp` crate, with Rust library name `focal_mcp`, that exposes the `focal-core` unified API through MCP for AI agents and MCP-capable applications.
+
+`focal-mcp` owns no storage format and defines no independent graph semantics. It is an adapter over `focal-core`; every graph operation exposed to MCP must preserve the same validation, traversal, mutation, ordering, deletion, promotion, and error behavior as the corresponding `focal-core` operation.
+
+The first version should target MCP protocol version `2025-11-25`.
+
+Crate and feature requirements:
+
+- Depend on `focal-core` and re-use or re-export its shared public data model for MCP request and response conversion.
+- Always support filesystem graphs through `focal-core`.
+- Gate SQLite graph support behind a Cargo feature named `sqlite`, forwarding to the matching `focal-core/sqlite` support.
+- Provide a config-driven library API that can be embedded by Rust applications.
+- Provide a `focal-mcp` executable entry point for MCP clients that launch stdio servers.
+- Require stdio transport support.
+- Optionally provide Streamable HTTP transport behind an opt-in Cargo feature such as `http`.
+- Keep any async runtime dependency out of the default stdio-only library surface unless the selected MCP implementation requires it.
+
+The crate should expose configuration similar to:
+
+```rust
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+pub enum OpenMode {
+    Init,
+    Open,
+}
+
+pub enum BackendConfig {
+    Fs {
+        root: PathBuf,
+        mode: OpenMode,
+    },
+    #[cfg(feature = "sqlite")]
+    Sqlite {
+        database_path: PathBuf,
+        graph_name: String,
+        mode: OpenMode,
+    },
+}
+
+pub enum TransportConfig {
+    Stdio,
+    #[cfg(feature = "http")]
+    StreamableHttp {
+        bind: SocketAddr,
+        endpoint_path: String,
+    },
+}
+
+pub struct ServerConfig {
+    pub backend: BackendConfig,
+    pub transport: TransportConfig,
+}
+
+pub fn run_stdio(config: ServerConfig) -> Result<(), focal_mcp::Error>;
+
+#[cfg(feature = "http")]
+pub async fn run_http(config: ServerConfig) -> Result<(), focal_mcp::Error>;
+```
+
+`OpenMode::Init` maps to `focal_core::init_fs` or `focal_core::init_sqlite`. `OpenMode::Open` maps to `focal_core::open_fs` or `focal_core::open_sqlite`. MCP tools operate on the configured graph for that server session; the first version should not expose arbitrary per-tool filesystem paths or database paths to the model.
+
+The first version is config-driven only. Embedded Rust callers provide `ServerConfig`; they do not pass an already-open `focal_core::Backend`, `focal_fs::IdeaGraph`, `focal_sqlite::SqliteGraph`, or borrowed `rusqlite::Connection` into the MCP server API.
+
+For SQLite, the server owns the database path from `BackendConfig::Sqlite`, opens or initializes the database internally, and may create the appropriate temporary `focal_core::Backend` value for each operation. This is an implementation detail; the observable MCP behavior must still match `focal-core`.
+
+### MCP Tools
+
+`focal-mcp` must declare the MCP `tools` capability and expose one tool for each shared `focal-core` graph operation. Tool names must be stable and prefixed with `focal_`:
+
+- `focal_add_context_document`
+- `focal_read_context_document`
+- `focal_update_context_document`
+- `focal_delete_context_document`
+- `focal_list_context_documents`
+- `focal_add_root_node`
+- `focal_add_child_node`
+- `focal_read_node`
+- `focal_update_node`
+- `focal_delete_node`
+- `focal_link_existing_node`
+- `focal_unlink_child`
+- `focal_list_roots`
+- `focal_list_children`
+- `focal_list_parents`
+- `focal_list_ancestors`
+- `focal_list_descendants`
+- `focal_rebuild_index`
+
+Tool argument schemas must be JSON Schema objects. They should use the same field names as the Rust public types:
+
+- IDs are strings using the same UUID validation as the core library.
+- `NewContextDocument` uses `{ "title": string, "markdown": string }`.
+- `ContextDocumentPatch` uses optional `title` and `markdown` fields; an omitted field means no change.
+- `NewNode` uses `kind`, `title`, and `content` fields.
+- `NodePatch` uses optional `title`, `content`, and `reviewed` fields; an omitted field means no change.
+- Statement content is represented as `{ "type": "statement", "body": string }`.
+- Question-answer content is represented as `{ "type": "qa", "question": string, "answer": string, "alternative_answers": string[] }`.
+- `DeleteMode` values are `fail_if_has_children` and `recursive`.
+- `OrphanPolicy` values are `move_to_roots`, `delete_if_no_parents`, and `fail_if_would_orphan`.
+- `TraversalOptions` uses an optional `max_depth` integer; omitted or `null` means no depth limit.
+
+Each successful tool call must return structured JSON content that corresponds to the underlying `focal-core` result:
+
+- ID-returning operations return `{ "id": string }`.
+- Read and update operations return the serialized `Node` or `ContextDocument`.
+- List and traversal operations return arrays of serialized summaries.
+- `rebuild_index` returns the serialized `GraphIndex`.
+- Unit-returning operations return at least `{ "ok": true }`.
+
+Tool results should also include a concise text block for clients that display tool output directly. When a tool returns or changes a specific node or context document, it may include an MCP resource link to the corresponding `focal://` resource.
+
+Recoverable graph errors from `focal-core` are tool execution errors, not protocol errors. They must return an MCP tool result with `isError: true` and structured error content that preserves at least:
+
+- Backend kind: `fs`, `sqlite`, or `sqlite_disabled`.
+- Error kind, such as `node_not_found`, `cycle_detected`, or `invalid_title`.
+- Human-readable message.
+- Relevant node ID, context document ID, graph path, database path, or logical path when the underlying error provides it.
+
+Protocol errors should be reserved for malformed MCP requests, unknown tool names, invalid JSON arguments that do not match the tool schema, and server initialization failures.
+
+Tool annotations must reflect graph side effects:
+
+- Read-only tools (`focal_read_*`, `focal_list_*`) should use `readOnlyHint: true` and `openWorldHint: false`.
+- `focal_rebuild_index` should not claim `readOnlyHint: true` because filesystem validation may create a missing `context/` directory.
+- Additive tools (`focal_add_*`) should use `readOnlyHint: false`, `destructiveHint: false`, and `openWorldHint: false`.
+- `focal_link_existing_node` should use `idempotentHint: true` because duplicate links are successful no-ops.
+- Update, unlink, and delete tools should use `readOnlyHint: false`, `destructiveHint: true`, and `openWorldHint: false`.
+
+### MCP Resources
+
+`focal-mcp` must declare the MCP `resources` capability and expose read-only graph views using `focal://` URIs. The first version should provide resource templates rather than listing every node in large graphs.
+
+Required resources and templates:
+
+- `focal://graph/index` returns `GraphIndex` as `application/json`.
+- `focal://contexts` returns `Vec<ContextSummary>` as `application/json`.
+- `focal://contexts/{context_id}` returns `ContextDocument` as `application/json`.
+- `focal://contexts/{context_id}/markdown` returns the context Markdown body as `text/markdown`.
+- `focal://roots` returns `Vec<NodeSummary>` as `application/json`.
+- `focal://nodes/{node_id}` returns `Node` as `application/json`.
+- `focal://nodes/{node_id}/children` returns `Vec<NodeSummary>` as `application/json`.
+- `focal://nodes/{node_id}/parents` returns `Vec<NodeSummary>` as `application/json`.
+- `focal://nodes/{node_id}/ancestors{?max_depth}` returns `Vec<NodeSummary>` as `application/json`.
+- `focal://nodes/{node_id}/descendants{?max_depth}` returns `Vec<NodeSummary>` as `application/json`.
+
+Resource reads must use the matching `focal-core` operation and must not expose files, SQLite rows, or paths outside the configured graph boundary. Resource URI parsing must validate node IDs, context document IDs, and query parameters before calling the core library.
+
+`focal://graph/index` is the validation resource and may call `focal_core::rebuild_index`. For filesystem graphs, serving this resource may create a missing `context/` directory as part of backend validation.
+
+Resource subscriptions and list-changed notifications are optional in the first version. If the server advertises either capability, it must send correct update notifications after mutating tools change affected graph resources.
+
+### MCP Prompts
+
+Prompt templates are optional. If `focal-mcp` exposes prompts, they must be workflow hints only; they must not add hidden graph semantics or perform graph changes without an explicit tool call. Prompt templates may reference `focal://` resources and should steer agents toward the stable tool names and resource URIs in this spec.
+
+### MCP Safety
+
+The MCP server must keep the configured graph as its authority boundary:
+
+- Do not expose tools that read or write arbitrary filesystem paths.
+- Do not expose tools that execute shell commands.
+- For stdio transport, write only MCP JSON-RPC messages to stdout; write logs to stderr.
+- Validate all tool arguments before calling `focal-core`.
+- Preserve `focal-fs` graph-root safety and `focal-sqlite` graph-namespace safety.
+- Do not treat graph Markdown content as instructions to the server itself.
+- Keep tool descriptions factual and specific so clients can present clear approval prompts for destructive operations.
+
+### MCP Testing Requirements
+
+`focal-mcp` tests should cover:
+
+- Stdio initialization and capability negotiation.
+- `tools/list` includes every required `focal_` tool with JSON schemas and appropriate annotations.
+- Every required MCP tool dispatches to the same behavior as the matching `focal-core` operation.
+- Tool execution errors preserve typed backend error information in structured content.
+- Tool responses include valid structured JSON content for IDs, nodes, context documents, lists, traversals, and indexes.
+- `resources/list` and `resources/templates/list` expose the required stable resources and templates.
+- `resources/read` returns the same graph data as the corresponding read, list, traversal, or index tool.
+- `focal://` resource URI parsing rejects invalid IDs, traversal attempts, unknown resources, and invalid `max_depth` values.
+- Stdio transport never writes non-MCP log text to stdout.
+- With the `sqlite` feature enabled, MCP tools and resources work against a SQLite graph namespace through `focal-core`.
 
 ## `focal-sqlite` SQLite Backend
 
@@ -1558,7 +1769,7 @@ Testing requirements:
 
 ## Spec Test Traceability
 
-Each row points to at least one `focal-fs` in-crate unit test and one public API integration test for the numbered section. Sections that define `focal-core` behavior should also point to the `focal-core` integration tests that protect the unified dispatch API. When `focal-sqlite` is implemented, it must add equivalent traceability for the shared behavior and SQLite-specific backend requirements.
+Each row points to at least one `focal-fs` in-crate unit test and one public API integration test for the numbered section. Sections that define `focal-core` behavior should also point to the `focal-core` integration tests that protect the unified dispatch API. When `focal-sqlite` is implemented, it must add equivalent traceability for the shared behavior and SQLite-specific backend requirements. When `focal-mcp` is implemented, it must add traceability for the MCP adapter requirements, including tool dispatch, resource reads, and transport behavior.
 
 | Section | Unit tests | Integration tests |
 |---|---|---|
@@ -1692,6 +1903,11 @@ The shared graph behavior is acceptable when:
 - Applications can add, read, edit, link, unlink, delete, list, traverse, validate, and manage context documents through `focal-core` without backend-specific dispatch code.
 - `focal-core` handles missing values and backend failures with `Result<T, focal_core::Error>` instead of panics or public `Option` return values.
 - `focal_core::Error` preserves backend failures as typed variants for `focal_fs::Error` and, when enabled, `focal_sqlite::Error`.
+- `focal-mcp` exposes every shared `focal-core` graph operation as a stable `focal_` MCP tool.
+- `focal-mcp` exposes read-only graph context through stable `focal://` MCP resources and resource templates.
+- `focal-mcp` tool and resource results preserve the same graph data, ordering, validation, traversal, and error behavior as `focal-core`.
+- `focal-mcp` supports stdio transport and does not write non-MCP log text to stdout.
+- `focal-mcp` does not expose arbitrary filesystem, database, shell, or network access beyond the configured graph backend and selected transport.
 - Canonical node promotion works when deleting or unlinking canonical parents with remaining aliases.
 - The library can list roots, children, parents, ancestors, and descendants.
 - Traversal is deterministic, breadth-first, and deduplicated.
