@@ -6,12 +6,18 @@ pub type NodeId = String;
 pub type ContextId = String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum NodeKind {
+    #[cfg_attr(feature = "serde", serde(rename = "statement"))]
     Statement,
+    #[cfg_attr(feature = "serde", serde(rename = "qa"))]
     QuestionAnswer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
@@ -25,10 +31,13 @@ pub struct Node {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "serde", serde(tag = "type"))]
 pub enum NodeContent {
-    Statement {
-        body: String,
-    },
+    #[cfg_attr(feature = "serde", serde(rename = "statement"))]
+    Statement { body: String },
+    #[cfg_attr(feature = "serde", serde(rename = "qa"))]
     QuestionAnswer {
         question: String,
         answer: String,
@@ -37,6 +46,8 @@ pub enum NodeContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NewNode {
     pub kind: NodeKind,
     pub title: String,
@@ -44,6 +55,8 @@ pub struct NewNode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NodePatch {
     pub title: Option<String>,
     pub content: Option<NodeContent>,
@@ -51,6 +64,8 @@ pub struct NodePatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NodeSummary {
     pub id: NodeId,
     pub kind: NodeKind,
@@ -61,6 +76,8 @@ pub struct NodeSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ContextDocument {
     pub id: ContextId,
     pub title: String,
@@ -72,18 +89,24 @@ pub struct ContextDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NewContextDocument {
     pub title: String,
     pub markdown: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ContextDocumentPatch {
     pub title: Option<String>,
     pub markdown: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ContextSummary {
     pub id: ContextId,
     pub title: String,
@@ -92,24 +115,37 @@ pub struct ContextSummary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum DeleteMode {
+    #[cfg_attr(feature = "serde", serde(rename = "fail_if_has_children"))]
     FailIfHasChildren,
+    #[cfg_attr(feature = "serde", serde(rename = "recursive"))]
     Recursive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum OrphanPolicy {
+    #[cfg_attr(feature = "serde", serde(rename = "move_to_roots"))]
     MoveToRoots,
+    #[cfg_attr(feature = "serde", serde(rename = "delete_if_no_parents"))]
     DeleteIfNoParents,
+    #[cfg_attr(feature = "serde", serde(rename = "fail_if_would_orphan"))]
     FailIfWouldOrphan,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TraversalOptions {
     pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GraphIndex {
     pub contexts: Vec<ContextSummary>,
     pub nodes: Vec<NodeSummary>,
@@ -118,6 +154,8 @@ pub struct GraphIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GraphEdge {
     pub parent_id: NodeId,
     pub child_id: NodeId,
@@ -126,6 +164,9 @@ pub struct GraphEdge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum GraphProblem {
     BrokenSymlink { path: PathBuf },
     DuplicateContextDocument { id: ContextId, paths: Vec<PathBuf> },

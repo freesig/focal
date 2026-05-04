@@ -1,0 +1,34 @@
+[package]
+name = "focal-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "focal_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "focal-mcp"
+path = "src/main.rs"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite", "focal-core/sqlite"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+focal-core = { path = "../focal_core", features = ["schema"] }
+rmcp = { version = "1.6.0", default-features = false, features = ["server", "transport-io"] }
+rusqlite = { version = "0.32", optional = true }
+schemars = "1.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+url = "2"
+uuid = "1"
+yaml_serde = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

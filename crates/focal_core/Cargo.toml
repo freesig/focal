@@ -10,6 +10,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
+schema = ["serde", "focal-types/schema"]
+serde = ["focal-types/serde"]
 sqlite = ["dep:focal-sqlite", "dep:rusqlite"]
 
 [dependencies]

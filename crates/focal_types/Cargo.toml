@@ -8,5 +8,12 @@ license.workspace = true
 name = "focal_types"
 path = "src/lib.rs"
 
+[features]
+default = []
+serde = ["dep:serde"]
+schema = ["serde", "dep:schemars"]
+
 [dependencies]
+schemars = { version = "1.1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 thiserror = "2"

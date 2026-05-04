@@ -2,6 +2,7 @@
 members = [
     "crates/focal_core",
     "crates/focal_fs",
+    "crates/focal_mcp",
     "crates/focal_sqlite",
     "crates/focal_types",
 ]
