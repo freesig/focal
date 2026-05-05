@@ -1,0 +1,4 @@
+interface:
+  display_name: "Focal Create Spec"
+  short_description: "Create Focal specs from ideas"
+  default_prompt: "Use $focal-create-spec to turn this idea or linked file into a Focal spec, ask only essential clarifying questions, and expand the spec to the depth I choose."
